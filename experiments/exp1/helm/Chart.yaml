@@ -1,0 +1,9 @@
+apiVersion: v2
+name: kcu-tenant
+description: |
+  Helm chart that provisions a single KCU Knowledge Portal tenant — Namespace,
+  ResourceQuota, LimitRange, and NetworkPolicy — using the same hand-crafted
+  templates that Experiment 1 compares against the Agentic Operator.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,152 +1,40 @@
 ---
+# ClusterRole for the Agentic Operator (kcu-portal-operator).
+# Permissions are intentionally scoped to the resources the controller
+# actually creates — Namespace, ResourceQuota, LimitRange, NetworkPolicy,
+# PriorityClass — plus the ChatSpace CRD itself.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: manager-role
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - configmaps
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - namespaces
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - persistentvolumeclaims
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - services
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - apps
-  resources:
-  - statefulsets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - networking.k8s.io
-  resources:
-  - networkpolicies
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - portal.kcu.ac.kr
-  resources:
-  - chatspaces
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - portal.kcu.ac.kr
-  resources:
-  - chatspaces/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - portal.kcu.ac.kr
-  resources:
-  - chatspaces/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
-  - rolebindings
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
-  - roles
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
+# Tenant namespaces and in-namespace policy objects
+- apiGroups: [""]
+  resources: [namespaces, resourcequotas, limitranges, configmaps]
+  verbs: [get, list, watch, create, update, patch, delete]
+
+# NetworkPolicy for HardIsolation
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [get, list, watch, create, update, patch, delete]
+
+# Cluster-scoped PriorityClasses managed by the Operator
+- apiGroups: [scheduling.k8s.io]
+  resources: [priorityclasses]
+  verbs: [get, list, watch, create, update, patch]
+
+# The ChatSpace CRD
+- apiGroups: [portal.kcu.ac.kr]
+  resources: [chatspaces]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [portal.kcu.ac.kr]
+  resources: [chatspaces/status]
+  verbs: [get, update, patch]
+- apiGroups: [portal.kcu.ac.kr]
+  resources: [chatspaces/finalizers]
+  verbs: [update]
+
+# Events for visibility
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]

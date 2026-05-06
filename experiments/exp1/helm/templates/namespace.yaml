@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "kcu-tenant.namespace" . }}
+  labels:
+    name: {{ include "kcu-tenant.namespace" . }}
+    {{- include "kcu-tenant.labels" . | nindent 4 }}

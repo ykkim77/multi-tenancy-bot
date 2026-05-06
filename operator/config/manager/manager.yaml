@@ -1,0 +1,87 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kcu-portal-system
+  labels:
+    name: kcu-portal-system
+    app.kubernetes.io/name: kcu-portal-operator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kcu-portal-operator
+  namespace: kcu-portal-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kcu-portal-operator-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: manager-role
+subjects:
+- kind: ServiceAccount
+  name: kcu-portal-operator
+  namespace: kcu-portal-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kcu-portal-operator
+  namespace: kcu-portal-system
+  labels:
+    app.kubernetes.io/name: kcu-portal-operator
+    app.kubernetes.io/component: agentic-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kcu-portal-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kcu-portal-operator
+        app.kubernetes.io/component: agentic-operator
+    spec:
+      serviceAccountName: kcu-portal-operator
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+      containers:
+      - name: manager
+        image: kcu/portal-operator:local
+        imagePullPolicy: IfNotPresent
+        args:
+        - --leader-elect=false
+        - --metrics-bind-address=:8080
+        - --health-probe-bind-address=:8081
+        ports:
+        - name: metrics
+          containerPort: 8080
+        - name: health
+          containerPort: 8081
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]

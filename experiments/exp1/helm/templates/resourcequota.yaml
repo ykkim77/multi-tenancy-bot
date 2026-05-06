@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tenant-quota
+  namespace: {{ include "kcu-tenant.namespace" . }}
+  labels:
+    {{- include "kcu-tenant.labels" . | nindent 4 }}
+spec:
+  hard:
+    requests.cpu: {{ .Values.quota.cpuRequests | quote }}
+    requests.memory: {{ .Values.quota.memoryRequests | quote }}
+    limits.cpu: {{ .Values.quota.cpuLimits | quote }}
+    limits.memory: {{ .Values.quota.memoryLimits | quote }}
+    count/pods: {{ .Values.quota.maxPods | quote }}

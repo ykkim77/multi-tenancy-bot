@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# kustomize build operator/config/default | kubectl apply -f -
+#
+# Applies, in order:
+#   1. CRD                  — adds the ChatSpace type to the cluster
+#   2. ClusterRole (manager-role) — RBAC for the Operator
+#   3. Operator manifest    — Namespace, ServiceAccount, Binding, Deployment
+resources:
+- ../crd/bases/portal.kcu.ac.kr_chatspaces.yaml
+- ../rbac/role.yaml
+- ../manager/manager.yaml

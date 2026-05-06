@@ -1,85 +1,117 @@
-# 실험 3: Hard Isolation — 커널 수준 자원 간섭 차단
+# Experiment 3 — Hard Isolation under Noisy Neighbors (재설계)
 
-## 목적
-자원 제약 환경에서 **Noise 테넌트(CPU + I/O 집약적 부하)**가 **Victim 테넌트(보호 대상)**에게 미치는 간섭을 측정하고, Operator의 Hard Isolation 메커니즘이 이를 얼마나 효과적으로 차단하는지 검증합니다.
+이 실험은 **noisy-neighbor** 가 존재하는 multi-tenant 환경에서 victim 테넌트의
+SLA(latency, jitter)가 어떻게 보호되는지를 정량 비교한다. 이전 실험의
+한계(2 tenant + 수동 정책)를 정면으로 풀어, 3-mode × 3-scenario 매트릭스로
+재설계되었다.
 
-## 실험 설계
+## ✨ 무엇이 바뀌었나
 
-### Noise 생성
-- **테넌트 1-3**: CPU burn + Disk I/O stress (대량의 벡터 검색 시뮬레이션)
-- 각 Noise 테넌트에 2개의 stress pod 배포 (총 6개 pod)
+| 항목 | 이전 | **현재** |
+|------|------|----------|
+| `Operator` 모드 | 사람이 PriorityClass / Quota / NetPol 을 손으로 적용 | **실제 Go Operator 가** ChatSpace CR 만 받고 정책 자동 생성 + 30 s 마다 자율 재조정 |
+| 비교 대상 | 2-way (baseline vs manual) | **3-way** (B1 baseline · B2 manual · B3 agentic) |
+| 시나리오 | 1 victim + 1 aggressor | **A · B · C** (1+1, 1+3, 5+5) — 5+5 는 priority/standard tier 혼합 |
+| 측정 지표 | latency, P95/P99, jitter | + **Operator 자동 대응 시간**, **재조정 횟수**, **agenticActions audit**, **tier 별 보호 차등** |
+| Figure | Figure 9 (4-panel) | **Figure 9 (3×4)** + **Figure 10 (신규, 1×3)** |
 
-### Victim 보호
-- **테넌트 4**: 중요 테넌트 (보호 대상)
-- P95 Latency를 시계열로 측정하여 간섭 영향 분석
+리뷰어 설득 논리:
+> 수동 정책 적용(현업 best practice)보다도 Agentic Operator 가 더 효과적이다.
 
-### 비교 시나리오
+## 비교 대상 (3 modes)
 
-#### Baseline (기본 네임스페이스)
-- 모든 테넌트에 동등한 ResourceQuota
-- PriorityClass 없음
-- 자원 간섭 차단 메커니즘 없음
+| ID | 이름 | 무엇을 적용 | 자동화 |
+|----|------|------------|--------|
+| **B1** | `baseline` | 모든 테넌트 동등 quota, NetPol 없음 | × (보호 없음) |
+| **B2** | `manual` | PriorityClass + 차등 quota + LimitRange + NetPol 직접 apply | × (정적, 현업 방식) |
+| **B3** | `agentic` | **`kubectl apply -f chatspace.yaml`** 만 | ○ (Operator 자동) |
 
-#### Operator (Hard Isolation)
-- **PriorityClass**: Victim에 높은 우선순위 부여 (10000 vs 100)
-- **차등 ResourceQuota**: Noise는 제한적, Victim은 보장된 자원
-- **LimitRange**: 컨테이너별 최대 자원 제한
-- **NetworkPolicy**: 테넌트 간 네트워크 격리
+## 시나리오 (3 scenarios)
 
-## 측정 지표
+| ID | victims | aggressors | idle background | 의도 |
+|----|---------|------------|-----------------|------|
+| **A** basic        | 1 (priority) | 1 | 0 | 가장 단순한 격리 효과 |
+| **B** multi-attack | 1 (priority) | 3 | 2 | 다수 공격자 + idle peer 가 boost trigger |
+| **C** multi-tenant | **3 priority + 2 standard** | 5 | 5 | 실 multi-tenant SLA + tier 별 보호 차등 검증 |
 
-1. **P95 Latency**: Victim 테넌트의 95 백분위수 응답 시간
-2. **P99 Latency**: Victim 테넌트의 99 백분위수 응답 시간
-3. **Jitter (σ)**: 응답 시간의 표준편차 (시스템 안정성 지표)
-4. **Time-Series**: 스트레스 기간 동안의 지연 시간 변화 추이
+## 측정 흐름
 
-## 사용법
+1. `cleanup_exp3()` → 깨끗한 상태로 시작.
+2. **Provisioning** — mode 별 분기.
+   - `B3` 의 경우 `ChatSpace` CR 만 apply → `Phase=Ready` 까지 polling.
+3. **Pre-noise baseline** — victim 별 ConfigMap CRUD round-trip × 15.
+4. **Stress 주입** — aggressor namespace 마다 1 개의 stress pod
+   (CPU spin loop + I/O burn). warm-up 5 s.
+5. **측정창 (`--duration`, default 60 s)** — victim latency 를 round-robin 으로
+   probe. **agentic mode 에서는 백그라운드 thread 가 3 s 마다 모든 ChatSpace 의
+   `status.agenticActions` / `status.lastUpdated` 를 폴링**해 timeline 을 수집.
+6. 통계 산출 (전체 + per-tier + agentic-only audit) → JSON 저장.
+
+## agentic 전용 추가 지표
+
+- **`first_response_s`** — stress 시작 이후 처음으로 `boosted` / `reclaimed`
+  action 이 등장한 시각 (Operator 자동 대응 시간).
+- **`new_actions_during_stress`** — 측정창 동안 새로 추가된 action 총 개수.
+- **`action_counts`** — `{boosted: X, reclaimed: Y, no_rebal: Z, ...}`.
+- **`per_cr.actions`** — ChatSpace 별 action 전체 ring-buffer.
+- **`per_tier.{priority,standard}.{p95_ms,std_ms,...}`** — tier 별 victim
+  통계 (Scenario C 에서만 의미 있음).
+
+## 실행
 
 ```bash
-# 1. 의존성 설치 (실험 1과 동일)
-pip3 install -r ../exp1/requirements.txt
+# Operator 가 클러스터에 배포된 상태에서:
+kubectl -n kcu-portal-system get deploy portal-operator
+kubectl get crd chatspaces.portal.kcu.ac.kr
 
-# 2. 실험 실행 (40초 스트레스 측정)
-python3 run_experiment_isolation.py --duration 40
+# 전체 실험 (3 시나리오 × 3 모드 × 1 run, ~15-25 분)
+python3 experiments/exp3/run_experiment_isolation.py
 
-# 3. 시각화
-python3 plot_isolation.py
+# 빠른 dry-run (시나리오 A 만)
+python3 experiments/exp3/run_experiment_isolation.py --scenarios A --duration 30
 
-# 4. 기존 결과로만 시각화
-python3 plot_isolation.py
+# Agentic 단독 분석
+python3 experiments/exp3/run_experiment_isolation.py --modes agentic --scenarios C
+
+# 결과만 다시 그리기
+python3 experiments/exp3/run_experiment_isolation.py --skip-apply
+python3 experiments/exp3/plot_isolation.py            # Figure 9
+python3 experiments/exp3/plot_agentic_analysis.py     # Figure 10
 ```
 
-## 출력
+운영 팁: `operator/main.go --rebalance-interval=10s` 로 배포해두면 30 s
+대기 없이 빠르게 결정 timeline 을 채울 수 있다.
 
-| 파일 | 설명 |
-|------|------|
-| `results/exp3_isolation_integrated.png` | 2x2 통합 그래프 (고해상도 300dpi) |
-| `results/exp3_isolation_integrated.pdf` | 논문용 벡터 그래프 |
-| `results/exp3_isolation_results.json` | 원시 데이터 (시계열, 통계) |
+## 산출물
 
-## 시각화 설명
+```
+results/
+├── exp3_isolation_results.json        # raw + per-CR snapshots + timeline
+├── exp3_fig9_isolation.png/.pdf        # Figure 9 (3×4 grid)
+└── exp3_fig10_agentic_analysis.png/.pdf  # Figure 10 (1×3, agentic-only)
+```
 
-### (a) Victim Tenant Latency Time-Series
-- 스트레스 기간 동안 Victim 테넌트의 응답 시간 변화
-- Moving average로 트렌드 표시
-- P95 수평선으로 임계값 표시
-- **범례**: 그래프 내부 우측 상단에 배치
+### Figure 9 (3×4)
+- 행: scenario A / B / C
+- 열: (a) time-series (b) CDF (c) P95/P99 (d) jitter
+- 색: `B1=blue dashed`, `B2=green dotted`, `B3=orange solid`
+- 패널 (c)/(d) 에는 `B3 vs B1` 개선률 텍스트 박스
 
-### (b) Latency Distribution (CDF)
-- 누적 분포 함수로 지연 시간 분포 비교
-- P95, P99 마커 표시
+### Figure 10 (신규, 1×3)
+- (a) Rebalance 발생 시점 vs victim latency 변화 (Scenario C, agentic)
+- (b) AgenticActions Timeline — per ChatSpace 의 boosted/reclaimed/no-rebal 분포
+- (c) Tier 별 보호 차등 — Scenario C 의 priority vs standard victim P95
+       (3 mode 에서 각각 비교 → priority 가 더 강하게 보호받는지 검증)
 
-### (c) P95 / P99 Latency Comparison
-- 막대 그래프로 백분위수 비교
-- P95 개선율 텍스트 상자 표시
+## 가설 (검증 대상)
 
-### (d) Response Stability (Jitter)
-- 표준편차(σ)로 시스템 안정성 비교
-- **색상 통일**: Baseline=파란색, Operator=주황색
-- Jitter 감소율 텍스트 상자 표시
-
-## 기대 결과
-
-- **P95 Improvement**: Operator가 Victim의 P95 지연 시간을 얼마나 개선했는지
-- **Jitter Reduction**: 응답 시간의 변동성(불안정성)을 얼마나 줄였는지
-- **Hard Isolation 효과**: 커널 수준의 자원 간섭을 차단하여 중요 테넌트의 성능을 보호함을 증명
+> **H1 (격리 효과)**: P95 latency 가 `B1 > B2 > B3` 순으로 단조 감소.
+>
+> **H2 (시나리오 강건성)**: aggressor 가 늘어나도(시나리오 B, C) `B3` 의
+> P95 증가율이 `B1`/`B2` 대비 가장 작다.
+>
+> **H3 (Operator 자동 대응 속도)**: `first_response_s ≤ 30s` (Operator 의
+> default rebalance cycle 안에 첫 결정).
+>
+> **H4 (Tier 차등)**: Scenario C 에서 `B3` 의 priority-tier victim P95 <
+> standard-tier victim P95 (≥ 20 % 차이).

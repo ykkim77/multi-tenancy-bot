@@ -1,15 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-실험 3: Hard Isolation — 커널 수준 자원 간섭 차단
+실험 3 (재설계): Hard Isolation under Noisy Neighbors
+─────────────────────────────────────────────────────
+이전 버전은 "Operator 모드"라고 부른 것이 사실은 사람이 PriorityClass /
+ResourceQuota / NetworkPolicy 를 손으로 적용한 것이었다.  이번 버전은
+이 한계를 정면으로 풀어, **세 가지 운영 방식**을 같은 시나리오에서 비교한다.
 
-Noise 테넌트(1-3): CPU + Memory/Disk I/O 집약적 부하
-Victim 테넌트(4): 보호 대상 — P95 Latency 시계열 측정
+비교 대상 (3 modes)
+───────────────────
+  B1  baseline : 모든 테넌트 동등 quota, NetworkPolicy 없음, 보호 없음
+  B2  manual   : 사람이 PriorityClass + 차등 quota + NetPol + LimitRange
+                 를 직접 kubectl apply (현업 모범 practice — 정적)
+  B3  agentic  : ChatSpace CR 만 제출. 실제 Operator 가
+                 - 첫 reconcile 에서 모든 정책 자동 생성
+                 - 30 초마다 클러스터 전체 자율 관찰
+                 - quota 재조정 + agenticActions 기록
 
-비교:
-  - Baseline : 기본 네임스페이스 (동등 ResourceQuota, PriorityClass 없음)
-  - Operator : PriorityClass(victim 우선), 차등 ResourceQuota, LimitRange,
-               NetworkPolicy 격리를 통한 Hard Isolation
+시나리오 (3 scenarios)
+──────────────────────
+  A  basic         : 1 victim + 1 aggressor                       (기준점)
+  B  multi-attack  : 1 victim + 3 aggressors + 2 idle background  (다수 공격자)
+  C  multi-tenant  : 5 victims + 5 aggressors + 5 idle background (실제 multi-tenant SLA)
+                     → 5 victims 중 3 명은 priority, 2 명은 standard tier 로
+                       구성하여 **tier-별 보호 차등** 검증
+
+수집 지표
+─────────
+  기존 (모드 무관):
+    - victim 별 latency time-series (probe = ConfigMap CRUD round-trip)
+    - latency CDF / P50 / P95 / P99 / jitter (std)
+  agentic 전용 추가 지표:
+    - agenticActions timeline:
+        * 노이즈 주입 시각 → 관련 action(보강/회수)이 등장한 시각 까지
+          걸린 "Operator 자동 대응 시간"
+        * 실험 기간 중 발생한 rebalance 횟수와 종류
+    - ChatSpace.status.lastUpdated 진행 → reconcile 빈도 측정
+    - tier 별 보호 차등(P95 priority vs standard victim)
 """
 from __future__ import annotations
 
@@ -18,9 +45,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 
@@ -28,50 +59,74 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = SCRIPT_DIR / "results"
-NS_PREFIX = "exp3-iso"
 
-NOISE_TENANTS = 3
-VICTIM_IDX = 3          # 0-indexed → tenant 4
-STRESS_DURATION = 40    # seconds of measurement under stress
-SAMPLE_INTERVAL = 0.05  # seconds between latency probes
+# ── Constants ────────────────────────────────────────────────────────
+NS_PREFIX = "exp3-iso"
+CS_PREFIX = "cs-exp3"
+SAMPLE_INTERVAL = 0.10            # latency probe spacing
+DEFAULT_DURATION = 60             # stress measurement window
+PRE_NOISE_SAMPLES = 15
+POLL_AGENTIC_EVERY = 3.0          # seconds between agenticActions snapshots
+WARMUP_AFTER_STRESS = 5           # seconds to let pods schedule
+
+SCENARIOS: Dict[str, Dict[str, Any]] = {
+    "A": {"name": "basic",        "victims": 1, "aggressors": 1, "idle_bg": 0,
+          "victim_tiers": ["priority"]},
+    "B": {"name": "multi-attack", "victims": 1, "aggressors": 3, "idle_bg": 2,
+          "victim_tiers": ["priority"]},
+    "C": {"name": "multi-tenant", "victims": 5, "aggressors": 5, "idle_bg": 5,
+          "victim_tiers": ["priority", "priority", "priority",
+                           "standard", "standard"]},
+}
+MODES: Tuple[str, ...] = ("baseline", "manual", "agentic")
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def run_cmd(cmd: List[str], check: bool = True, timeout: int = 60, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout, **kw)
+def run_cmd(cmd: List[str], *, check: bool = False, timeout: int = 60,
+            stdin: Optional[str] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, input=stdin, capture_output=True, text=True,
+                          check=check, timeout=timeout)
 
 
-def ns_name(mode: str, idx: int) -> str:
-    return f"{NS_PREFIX}-{mode}-{idx}"
+def parse_k8s_time(ts: str) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 # ── YAML generators ──────────────────────────────────────────────────
 
-def yaml_namespace(name: str) -> str:
+def yaml_namespace(name: str, scenario: str, mode: str, role: str) -> str:
     return (
-        f"apiVersion: v1\nkind: Namespace\nmetadata:\n"
-        f"  name: {name}\n  labels:\n    experiment: exp3\n"
+        f"apiVersion: v1\nkind: Namespace\n"
+        f"metadata:\n  name: {name}\n  labels:\n"
+        f"    experiment: exp3\n    scenario: {scenario}\n"
+        f"    mode: {mode}\n    role: {role}\n"
     )
 
 
 def yaml_priority_class(name: str, value: int, preempt: bool = False) -> str:
-    preempt_str = "PreemptLowerPriority" if preempt else "Never"
     return (
         f"apiVersion: scheduling.k8s.io/v1\nkind: PriorityClass\n"
-        f"metadata:\n  name: {name}\n"
+        f"metadata:\n  name: {name}\n  labels:\n    experiment: exp3\n"
         f"value: {value}\nglobalDefault: false\n"
-        f"preemptionPolicy: {preempt_str}\n"
-        f"description: \"Experiment 3 priority class\"\n"
+        f"preemptionPolicy: {'PreemptLowerPriority' if preempt else 'Never'}\n"
+        f"description: \"exp3 priority class\"\n"
     )
 
 
-def yaml_quota(ns: str, cpu_req: str, mem_req: str, cpu_lim: str, mem_lim: str, pods: str = "30") -> str:
+def yaml_quota(ns: str, cpu_req: str, mem_req: str, cpu_lim: str, mem_lim: str,
+               pods: str = "20") -> str:
     return (
-        f"apiVersion: v1\nkind: ResourceQuota\nmetadata:\n"
-        f"  name: tenant-quota\n  namespace: {ns}\n"
+        f"apiVersion: v1\nkind: ResourceQuota\n"
+        f"metadata:\n  name: tenant-quota\n  namespace: {ns}\n"
+        f"  labels:\n    experiment: exp3\n"
         f"spec:\n  hard:\n"
         f"    requests.cpu: \"{cpu_req}\"\n    requests.memory: \"{mem_req}\"\n"
         f"    limits.cpu: \"{cpu_lim}\"\n    limits.memory: \"{mem_lim}\"\n"
@@ -79,23 +134,25 @@ def yaml_quota(ns: str, cpu_req: str, mem_req: str, cpu_lim: str, mem_lim: str, 
     )
 
 
-def yaml_limitrange(ns: str, cpu_def: str, mem_def: str, cpu_max: str, mem_max: str) -> str:
+def yaml_limitrange(ns: str, cpu_def: str, mem_def: str,
+                    cpu_max: str, mem_max: str) -> str:
     return (
-        f"apiVersion: v1\nkind: LimitRange\nmetadata:\n"
-        f"  name: tenant-limits\n  namespace: {ns}\n"
-        f"spec:\n  limits:\n  - default:\n"
-        f"      cpu: \"{cpu_def}\"\n      memory: \"{mem_def}\"\n"
+        f"apiVersion: v1\nkind: LimitRange\n"
+        f"metadata:\n  name: tenant-limits\n  namespace: {ns}\n"
+        f"  labels:\n    experiment: exp3\n"
+        f"spec:\n  limits:\n  - type: Container\n"
+        f"    default:\n      cpu: \"{cpu_def}\"\n      memory: \"{mem_def}\"\n"
         f"    max:\n      cpu: \"{cpu_max}\"\n      memory: \"{mem_max}\"\n"
         f"    defaultRequest:\n      cpu: \"50m\"\n      memory: \"64Mi\"\n"
-        f"    type: Container\n"
     )
 
 
-def yaml_netpol_deny_cross(ns: str) -> str:
+def yaml_netpol_isolate(ns: str) -> str:
     return (
         f"apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n"
-        f"metadata:\n  name: deny-cross-tenant\n  namespace: {ns}\n"
-        f"spec:\n  podSelector: {{}}\n  policyTypes:\n  - Ingress\n  - Egress\n"
+        f"metadata:\n  name: tenant-isolation\n  namespace: {ns}\n"
+        f"  labels:\n    experiment: exp3\n"
+        f"spec:\n  podSelector: {{}}\n  policyTypes: [Ingress, Egress]\n"
         f"  ingress:\n  - from:\n    - podSelector: {{}}\n"
         f"  egress:\n  - to:\n    - podSelector: {{}}\n"
         f"  - to:\n    - namespaceSelector:\n        matchLabels:\n"
@@ -104,325 +161,623 @@ def yaml_netpol_deny_cross(ns: str) -> str:
 
 
 def yaml_stress_pod(ns: str, name: str, priority_class: str = "",
-                    cpu_req: str = "200m", mem_req: str = "128Mi",
+                    cpu_req: str = "100m", mem_req: str = "64Mi",
                     cpu_lim: str = "500m", mem_lim: str = "256Mi") -> str:
-    """CPU stress + I/O stress in a single pod with two containers."""
     pc_line = f"  priorityClassName: {priority_class}\n" if priority_class else ""
-    return f"""apiVersion: v1
-kind: Pod
-metadata:
-  name: {name}
-  namespace: {ns}
-  labels:
-    role: noise
-spec:
-{pc_line}  terminationGracePeriodSeconds: 0
-  containers:
-  - name: cpu-burn
-    image: busybox
-    command: ["sh", "-c", "while true; do :; done"]
-    resources:
-      requests:
-        cpu: "{cpu_req}"
-        memory: "64Mi"
-      limits:
-        cpu: "{cpu_lim}"
-        memory: "128Mi"
-  - name: io-burn
-    image: busybox
-    command:
-    - sh
-    - -c
-    - |
-      while true; do
-        dd if=/dev/urandom of=/tmp/junk bs=4k count=2048 2>/dev/null
-        rm -f /tmp/junk
-      done
-    resources:
-      requests:
-        cpu: "50m"
-        memory: "{mem_req}"
-      limits:
-        cpu: "200m"
-        memory: "{mem_lim}"
-  restartPolicy: Always
-"""
-
-
-# ── Apply / measure helpers ──────────────────────────────────────────
-
-def apply_yaml(yaml_str: str) -> float:
-    t0 = time.perf_counter()
-    r = subprocess.run(
-        ["kubectl", "apply", "-f", "-"],
-        input=yaml_str, capture_output=True, text=True, check=False, timeout=30,
+    return (
+        f"apiVersion: v1\nkind: Pod\n"
+        f"metadata:\n  name: {name}\n  namespace: {ns}\n"
+        f"  labels:\n    role: noise\n    experiment: exp3\n"
+        f"spec:\n{pc_line}  terminationGracePeriodSeconds: 0\n"
+        f"  containers:\n"
+        f"  - name: cpu-burn\n    image: busybox\n"
+        f"    command: [\"sh\",\"-c\",\"while true; do :; done\"]\n"
+        f"    resources:\n"
+        f"      requests: {{cpu: \"{cpu_req}\", memory: \"{mem_req}\"}}\n"
+        f"      limits:   {{cpu: \"{cpu_lim}\", memory: \"{mem_lim}\"}}\n"
+        f"  - name: io-burn\n    image: busybox\n"
+        f"    command:\n"
+        f"    - sh\n    - -c\n"
+        f"    - |\n"
+        f"      while true; do dd if=/dev/urandom of=/tmp/junk bs=4k count=2048 2>/dev/null; rm -f /tmp/junk; done\n"
+        f"    resources:\n"
+        f"      requests: {{cpu: \"50m\", memory: \"64Mi\"}}\n"
+        f"      limits:   {{cpu: \"200m\", memory: \"128Mi\"}}\n"
+        f"  restartPolicy: Always\n"
     )
-    lat = time.perf_counter() - t0
+
+
+def yaml_chatspace(name: str, tenant_id: str, tier: str, scenario: str,
+                   role: str, usage: str = "active",
+                   hard_isolation: bool = True) -> str:
+    return (
+        f"apiVersion: portal.kcu.ac.kr/v1\nkind: ChatSpace\n"
+        f"metadata:\n  name: {name}\n"
+        f"  annotations:\n    portal.kcu.ac.kr/usage: {usage}\n"
+        f"  labels:\n"
+        f"    experiment: exp3\n    scenario: {scenario}\n"
+        f"    mode: agentic\n    role: {role}\n    tier: {tier}\n"
+        f"spec:\n  tenantId: {tenant_id}\n  tier: {tier}\n"
+        f"  agentic:\n    enabled: true\n"
+        f"    hardIsolation: {str(hard_isolation).lower()}\n"
+        f"    reclaimIdleAfterSeconds: 60\n    activeBoostFactor: \"1.5\"\n"
+    )
+
+
+# ── kubectl helpers ──────────────────────────────────────────────────
+
+def apply_yaml(yaml_str: str) -> None:
+    r = run_cmd(["kubectl", "apply", "-f", "-"], stdin=yaml_str, timeout=30)
     if r.returncode != 0:
-        log(f"    ⚠ apply error: {r.stderr.strip()[:120]}")
-    return lat
+        log(f"    apply error: {r.stderr.strip()[:160]}")
+
+
+def apply_yaml_parallel(yamls: List[str], workers: int = 8) -> None:
+    if not yamls:
+        return
+    with ThreadPoolExecutor(max_workers=min(workers, len(yamls))) as ex:
+        list(ex.map(apply_yaml, yamls))
 
 
 def measure_victim_latency(ns: str) -> float:
-    """
-    Probe the victim namespace: create a ConfigMap, read it back, delete it.
-    Returns round-trip wall-clock time (seconds).
-    """
-    cm_name = f"probe-{int(time.time()*1000) % 100000}"
+    """Round-trip time for ConfigMap create → get → delete in `ns`."""
+    cm_name = f"probe-{int(time.time() * 1000) % 100000}"
     cm_yaml = (
-        f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n"
-        f"  name: {cm_name}\n  namespace: {ns}\ndata:\n  key: value\n"
+        f"apiVersion: v1\nkind: ConfigMap\n"
+        f"metadata:\n  name: {cm_name}\n  namespace: {ns}\n"
+        f"data:\n  k: v\n"
     )
-
     t0 = time.perf_counter()
-    # create
-    subprocess.run(["kubectl", "apply", "-f", "-"],
-                   input=cm_yaml, capture_output=True, text=True, check=False, timeout=15)
-    # read
-    subprocess.run(["kubectl", "get", "configmap", cm_name, "-n", ns, "-o", "json"],
-                   capture_output=True, text=True, check=False, timeout=15)
-    # delete
-    subprocess.run(["kubectl", "delete", "configmap", cm_name, "-n", ns, "--ignore-not-found"],
-                   capture_output=True, text=True, check=False, timeout=15)
+    run_cmd(["kubectl", "apply", "-f", "-"], stdin=cm_yaml, timeout=15)
+    run_cmd(["kubectl", "get", "configmap", cm_name, "-n", ns, "-o", "json"], timeout=15)
+    run_cmd(["kubectl", "delete", "configmap", cm_name, "-n", ns,
+             "--ignore-not-found"], timeout=15)
     return time.perf_counter() - t0
 
 
-def wait_pods_running(ns: str, timeout: int = 60) -> bool:
-    """Wait until all pods in ns are Running or timeout."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        r = run_cmd(["kubectl", "get", "pods", "-n", ns, "-o",
-                     "jsonpath={.items[*].status.phase}"], check=False)
-        phases = r.stdout.strip().split() if r.stdout.strip() else []
-        if phases and all(p == "Running" for p in phases):
-            return True
-        time.sleep(2)
-    return False
+def get_chatspace(name: str) -> Optional[Dict[str, Any]]:
+    r = run_cmd(["kubectl", "get", "chatspace", name, "-o", "json"], timeout=15)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def is_chatspace_ready(name: str) -> bool:
+    obj = get_chatspace(name)
+    if not obj:
+        return False
+    return (obj.get("status") or {}).get("phase") == "Ready"
+
+
+def is_ns_ready(ns: str) -> bool:
+    for kind in ("resourcequota/tenant-quota", "limitrange/tenant-limits"):
+        if run_cmd(["kubectl", "get", kind, "-n", ns, "-o", "name"]).returncode != 0:
+            return False
+    return True
 
 
 def cleanup_exp3() -> None:
-    log("  Cleaning up experiment 3 resources...")
-    # Delete namespaces
-    r = run_cmd(["kubectl", "get", "ns", "-l", "experiment=exp3",
-                 "-o", "jsonpath={.items[*].metadata.name}"], check=False)
+    log("  Cleaning up exp3 resources ...")
+    # ChatSpaces
+    r = run_cmd(["kubectl", "get", "chatspace", "-l", "experiment=exp3",
+                 "-o", "jsonpath={.items[*].metadata.name}"])
     if r.returncode == 0 and r.stdout.strip():
-        for ns in r.stdout.strip().split():
-            run_cmd(["kubectl", "delete", "ns", ns, "--ignore-not-found",
-                     "--timeout=30s", "--grace-period=0", "--force"], check=False)
-    # Delete PriorityClasses
+        names = r.stdout.strip().split()
+        run_cmd(["kubectl", "delete", "chatspace", *names,
+                 "--ignore-not-found", "--wait=false"], timeout=120)
+    # Namespaces (manual / baseline)
+    r = run_cmd(["kubectl", "get", "ns", "-l", "experiment=exp3",
+                 "-o", "jsonpath={.items[*].metadata.name}"])
+    if r.returncode == 0 and r.stdout.strip():
+        nss = r.stdout.strip().split()
+        run_cmd(["kubectl", "delete", "ns", *nss, "--ignore-not-found",
+                 "--wait=false", "--grace-period=0", "--force"], timeout=180)
+    # Manual-mode PriorityClasses
     for pc in ("exp3-noise-low", "exp3-victim-high"):
-        run_cmd(["kubectl", "delete", "priorityclass", pc, "--ignore-not-found"], check=False)
+        run_cmd(["kubectl", "delete", "priorityclass", pc, "--ignore-not-found"])
+    time.sleep(2)
 
 
-# ── Scenario runners ─────────────────────────────────────────────────
+# ── Tenant model ─────────────────────────────────────────────────────
 
-def run_scenario(mode: str) -> Dict[str, Any]:
-    """
-    mode='baseline' : 동등 ResourceQuota, PriorityClass 없음
-    mode='operator'  : 차등 Quota, PriorityClass, LimitRange, NetworkPolicy
-    """
-    log(f"\n{'='*60}")
-    log(f"  SCENARIO: {mode.upper()}")
-    log(f"{'='*60}")
+@dataclass
+class Tenant:
+    role: str          # 'victim' | 'aggressor' | 'background'
+    idx: int
+    tier: str          # 'priority' | 'standard'
+    namespace: str
+    cs_name: Optional[str] = None  # only set for agentic mode
+    expected_idle: bool = False    # ground-truth flag for agentic
 
-    victim_ns = ns_name(mode, VICTIM_IDX)
-    noise_nss = [ns_name(mode, i) for i in range(NOISE_TENANTS)]
 
-    # ── 1. Create namespaces ─────────────────────────────────────
-    log("  [1/5] Creating namespaces...")
-    for i in range(NOISE_TENANTS + 1):
-        apply_yaml(yaml_namespace(ns_name(mode, i)))
+def build_tenants(scenario: str, mode: str) -> List[Tenant]:
+    sc = SCENARIOS[scenario]
+    out: List[Tenant] = []
+    for i in range(sc["victims"]):
+        tier = sc["victim_tiers"][i] if i < len(sc["victim_tiers"]) else "priority"
+        if mode == "agentic":
+            ns = f"tenant-exp3-{scenario.lower()}-victim-{i}"
+            cs = f"{CS_PREFIX}-{scenario.lower()}-victim-{i}"
+        else:
+            ns = f"{NS_PREFIX}-{scenario.lower()}-{mode}-victim-{i}"
+            cs = None
+        out.append(Tenant("victim", i, tier, ns, cs, expected_idle=False))
+    for i in range(sc["aggressors"]):
+        if mode == "agentic":
+            ns = f"tenant-exp3-{scenario.lower()}-aggr-{i}"
+            cs = f"{CS_PREFIX}-{scenario.lower()}-aggr-{i}"
+        else:
+            ns = f"{NS_PREFIX}-{scenario.lower()}-{mode}-aggr-{i}"
+            cs = None
+        out.append(Tenant("aggressor", i, "standard", ns, cs, expected_idle=False))
+    for i in range(sc["idle_bg"]):
+        if mode == "agentic":
+            ns = f"tenant-exp3-{scenario.lower()}-bg-{i}"
+            cs = f"{CS_PREFIX}-{scenario.lower()}-bg-{i}"
+        else:
+            ns = f"{NS_PREFIX}-{scenario.lower()}-{mode}-bg-{i}"
+            cs = None
+        out.append(Tenant("background", i, "internal", ns, cs, expected_idle=True))
+    return out
 
-    # ── 2. Apply policies ────────────────────────────────────────
-    log("  [2/5] Applying resource policies...")
 
+# ── Provisioning per mode ────────────────────────────────────────────
+
+def provision_baseline(scenario: str, tenants: List[Tenant]) -> None:
+    """B1 — equal fixed quota for everyone, no NetPol, no PriorityClass."""
+    yamls: List[str] = []
+    for t in tenants:
+        yamls.append(yaml_namespace(t.namespace, scenario, "baseline", t.role))
+    apply_yaml_parallel(yamls)
+
+    yamls = []
+    for t in tenants:
+        yamls.append(yaml_quota(t.namespace, "300m", "256Mi", "600m", "512Mi"))
+        yamls.append(yaml_limitrange(t.namespace, "100m", "128Mi", "300m", "256Mi"))
+    apply_yaml_parallel(yamls)
+
+
+def provision_manual(scenario: str, tenants: List[Tenant]) -> None:
+    """B2 — manually applied PriorityClass + tiered quota + NetPol + LimitRange."""
+    apply_yaml(yaml_priority_class("exp3-noise-low", 100))
+    apply_yaml(yaml_priority_class("exp3-victim-high", 10000, preempt=True))
+
+    yamls = [yaml_namespace(t.namespace, scenario, "manual", t.role) for t in tenants]
+    apply_yaml_parallel(yamls)
+
+    yamls = []
+    for t in tenants:
+        if t.role == "victim":
+            if t.tier == "priority":
+                yamls.append(yaml_quota(t.namespace, "2", "2Gi", "4", "4Gi", pods="30"))
+                yamls.append(yaml_limitrange(t.namespace, "500m", "512Mi", "2", "2Gi"))
+            else:  # standard tier victim
+                yamls.append(yaml_quota(t.namespace, "500m", "512Mi", "1", "1Gi", pods="10"))
+                yamls.append(yaml_limitrange(t.namespace, "200m", "128Mi", "1", "1Gi"))
+        elif t.role == "aggressor":
+            yamls.append(yaml_quota(t.namespace, "200m", "128Mi", "500m", "256Mi", pods="3"))
+            yamls.append(yaml_limitrange(t.namespace, "100m", "64Mi", "300m", "128Mi"))
+        else:  # background
+            yamls.append(yaml_quota(t.namespace, "100m", "128Mi", "300m", "256Mi", pods="5"))
+            yamls.append(yaml_limitrange(t.namespace, "50m", "64Mi", "200m", "128Mi"))
+        yamls.append(yaml_netpol_isolate(t.namespace))
+    apply_yaml_parallel(yamls)
+
+
+def provision_agentic(scenario: str, tenants: List[Tenant]) -> None:
+    """B3 — submit ChatSpace CRs only; Operator does the rest."""
+    yamls: List[str] = []
+    for t in tenants:
+        usage = "idle" if t.expected_idle else "active"
+        yamls.append(yaml_chatspace(
+            name=t.cs_name, tenant_id=f"exp3-{scenario.lower()}-{t.role}-{t.idx}",
+            tier=t.tier, scenario=scenario, role=t.role, usage=usage,
+            hard_isolation=True))
+    apply_yaml_parallel(yamls, workers=4)
+
+    # Wait until all CRs reach Phase=Ready
+    deadline = time.time() + 180
+    pending = [t.cs_name for t in tenants]
+    while pending and time.time() < deadline:
+        still = [n for n in pending if not is_chatspace_ready(n)]
+        if len(still) != len(pending):
+            log(f"    Operator: {len(tenants) - len(still)}/{len(tenants)} ChatSpaces Ready")
+        pending = still
+        if not pending:
+            break
+        time.sleep(2)
+    if pending:
+        log(f"    ⚠ {len(pending)} ChatSpaces did not reach Ready in 180s")
+
+
+# ── agenticActions polling (background thread) ───────────────────────
+
+@dataclass
+class AgenticSnapshot:
+    t_rel: float
+    cs_name: str
+    role: str
+    tier: str
+    phase: Optional[str]
+    last_updated_epoch: Optional[float]
+    actions_len: int
+    latest_action: Optional[str]
+
+
+def _classify_action(action: str) -> str:
+    a = action.lower()
+    if "reclaimed" in a:
+        return "reclaimed"
+    if "boosted" in a:
+        return "boosted"
+    if "no rebalancing" in a:
+        return "no_rebal"
+    if "agentic disabled" in a:
+        return "agentic_off"
+    if "falling back" in a:
+        return "fallback"
+    return "other"
+
+
+class AgenticPoller(threading.Thread):
+    """Polls every ChatSpace's status during the stress window and records
+    the timeline of `agenticActions` plus reconcile timestamps."""
+
+    def __init__(self, tenants: List[Tenant], t0: float, stop_evt: threading.Event):
+        super().__init__(daemon=True)
+        self.tenants = [t for t in tenants if t.cs_name]
+        self.t0 = t0
+        self.stop_evt = stop_evt
+        self.snapshots: List[AgenticSnapshot] = []
+        # Final per-CR action lists
+        self.final: Dict[str, Dict[str, Any]] = {}
+
+    def run(self) -> None:
+        while not self.stop_evt.is_set():
+            for t in self.tenants:
+                obj = get_chatspace(t.cs_name)
+                if not obj:
+                    continue
+                status = obj.get("status") or {}
+                actions = status.get("agenticActions") or []
+                self.snapshots.append(AgenticSnapshot(
+                    t_rel=time.perf_counter() - self.t0,
+                    cs_name=t.cs_name, role=t.role, tier=t.tier,
+                    phase=status.get("phase"),
+                    last_updated_epoch=parse_k8s_time(status.get("lastUpdated", "")),
+                    actions_len=len(actions),
+                    latest_action=actions[-1] if actions else None,
+                ))
+                self.final[t.cs_name] = {
+                    "role": t.role, "tier": t.tier,
+                    "actions": list(actions),
+                    "applied_quota": status.get("appliedQuota"),
+                    "phase": status.get("phase"),
+                    "created_epoch": parse_k8s_time(
+                        obj.get("metadata", {}).get("creationTimestamp", "")),
+                    "last_updated_epoch": parse_k8s_time(status.get("lastUpdated", "")),
+                }
+            if self.stop_evt.wait(POLL_AGENTIC_EVERY):
+                break
+
+
+# ── Probing helpers ──────────────────────────────────────────────────
+
+def measure_pre_noise(victims: List[Tenant], n_samples: int = PRE_NOISE_SAMPLES
+                      ) -> Dict[str, List[float]]:
+    out: Dict[str, List[float]] = {v.namespace: [] for v in victims}
+    for _ in range(n_samples):
+        for v in victims:
+            out[v.namespace].append(measure_victim_latency(v.namespace))
+            time.sleep(SAMPLE_INTERVAL)
+    return out
+
+
+def deploy_stress(scenario: str, mode: str, aggressors: List[Tenant]) -> None:
+    """Deploy 1 stress pod per aggressor namespace."""
+    pc = "" if mode != "manual" else "exp3-noise-low"
+    yamls: List[str] = []
+    for t in aggressors:
+        yamls.append(yaml_stress_pod(
+            ns=t.namespace, name=f"stress-{t.idx}", priority_class=pc,
+        ))
+    apply_yaml_parallel(yamls)
+
+
+def stress_window(victims: List[Tenant], duration: float
+                  ) -> Dict[str, List[Tuple[float, float]]]:
+    """Round-robin probe of victim namespaces for `duration` seconds.
+    Returns per-victim list of (t_rel, latency_s)."""
+    out: Dict[str, List[Tuple[float, float]]] = {v.namespace: [] for v in victims}
+    t0 = time.perf_counter()
+    last_log = 0.0
+    while time.perf_counter() - t0 < duration:
+        t_rel = time.perf_counter() - t0
+        for v in victims:
+            lat = measure_victim_latency(v.namespace)
+            out[v.namespace].append((t_rel, lat))
+            time.sleep(SAMPLE_INTERVAL)
+        if t_rel - last_log >= 10.0:
+            last = {ns: vs[-1][1] * 1000 for ns, vs in out.items() if vs}
+            log(f"    t={t_rel:5.1f}s  latencies(ms)=" +
+                ", ".join(f"{ns.split('-')[-1]}:{v:.0f}" for ns, v in last.items()))
+            last_log = t_rel
+    return out
+
+
+# ── One full (scenario, mode) run ────────────────────────────────────
+
+def run_one(scenario: str, mode: str, duration: float, run_idx: int
+            ) -> Dict[str, Any]:
+    log(f"\n{'─' * 64}")
+    log(f"  Scenario {scenario} ({SCENARIOS[scenario]['name']}) | "
+        f"mode={mode.upper()} | run={run_idx + 1}")
+    log(f"{'─' * 64}")
+    cleanup_exp3()
+    time.sleep(1)
+
+    tenants = build_tenants(scenario, mode)
+    victims = [t for t in tenants if t.role == "victim"]
+    aggressors = [t for t in tenants if t.role == "aggressor"]
+
+    # ── 1. Provision ───────────────────────────────────────────────
+    log(f"  [1/5] Provisioning {len(tenants)} tenants ({mode}) ...")
+    t_prov0 = time.perf_counter()
     if mode == "baseline":
-        # Equal quotas for everyone
-        for i in range(NOISE_TENANTS + 1):
-            ns = ns_name(mode, i)
-            apply_yaml(yaml_quota(ns, "2", "2Gi", "4", "4Gi"))
-            apply_yaml(yaml_limitrange(ns, "500m", "512Mi", "2", "2Gi"))
-    else:
-        # PriorityClasses
-        apply_yaml(yaml_priority_class("exp3-noise-low", 100))
-        apply_yaml(yaml_priority_class("exp3-victim-high", 10000, preempt=True))
+        provision_baseline(scenario, tenants)
+    elif mode == "manual":
+        provision_manual(scenario, tenants)
+    elif mode == "agentic":
+        provision_agentic(scenario, tenants)
+    prov_dt = time.perf_counter() - t_prov0
+    log(f"        provisioning took {prov_dt:.1f}s")
 
-        # Noise tenants: strict limits
-        for i in range(NOISE_TENANTS):
-            ns = ns_name(mode, i)
-            apply_yaml(yaml_quota(ns, "500m", "512Mi", "1", "1Gi", pods="5"))
-            apply_yaml(yaml_limitrange(ns, "200m", "128Mi", "500m", "256Mi"))
-            apply_yaml(yaml_netpol_deny_cross(ns))
+    # Validate non-agentic ns are ready
+    if mode != "agentic":
+        for t in tenants:
+            for _ in range(20):
+                if is_ns_ready(t.namespace):
+                    break
+                time.sleep(0.5)
 
-        # Victim tenant: generous guaranteed resources
-        apply_yaml(yaml_quota(victim_ns, "4", "4Gi", "6", "8Gi", pods="20"))
-        apply_yaml(yaml_limitrange(victim_ns, "500m", "512Mi", "2", "2Gi"))
-        apply_yaml(yaml_netpol_deny_cross(victim_ns))
+    # ── 2. Pre-noise baseline measurement ──────────────────────────
+    log(f"  [2/5] Pre-noise baseline ({PRE_NOISE_SAMPLES} samples × {len(victims)} victims) ...")
+    pre_noise = measure_pre_noise(victims)
 
-    # ── 3. Baseline latency (before noise) ───────────────────────
-    log("  [3/5] Measuring baseline latency (no noise)...")
-    pre_noise_latencies: List[float] = []
-    for _ in range(20):
-        lat = measure_victim_latency(victim_ns)
-        pre_noise_latencies.append(lat)
-        time.sleep(SAMPLE_INTERVAL)
-    log(f"    Pre-noise: mean={np.mean(pre_noise_latencies)*1000:.1f}ms, "
-        f"p95={np.percentile(pre_noise_latencies, 95)*1000:.1f}ms")
+    # ── 3. Deploy stress pods ──────────────────────────────────────
+    log(f"  [3/5] Deploying {len(aggressors)} stress pods ...")
+    stress_t0_epoch = time.time()
+    deploy_stress(scenario, mode, aggressors)
+    log(f"        warm-up {WARMUP_AFTER_STRESS}s ...")
+    time.sleep(WARMUP_AFTER_STRESS)
 
-    # ── 4. Deploy noise pods ─────────────────────────────────────
-    log("  [4/5] Deploying noise pods in tenants 1-3...")
-    pc = "" if mode == "baseline" else "exp3-noise-low"
+    # ── 4. Concurrently measure victim latency + poll agenticActions
+    log(f"  [4/5] Measuring victim latency ({duration}s) "
+        f"{'+ polling agenticActions' if mode == 'agentic' else ''} ...")
+    poller: Optional[AgenticPoller] = None
+    stop_evt = threading.Event()
+    if mode == "agentic":
+        poller = AgenticPoller(tenants, t0=time.perf_counter(), stop_evt=stop_evt)
+        poller.start()
 
-    if mode == "baseline":
-        stress_cpu_req, stress_mem_req = "200m", "128Mi"
-        stress_cpu_lim, stress_mem_lim = "500m", "256Mi"
-    else:
-        stress_cpu_req, stress_mem_req = "100m", "64Mi"
-        stress_cpu_lim, stress_mem_lim = "250m", "128Mi"
+    series = stress_window(victims, duration)
 
-    for i in range(NOISE_TENANTS):
-        ns = ns_name(mode, i)
-        for j in range(2):  # 2 stress pods per noise tenant
-            apply_yaml(yaml_stress_pod(
-                ns, f"stress-{j}", priority_class=pc,
-                cpu_req=stress_cpu_req, mem_req=stress_mem_req,
-                cpu_lim=stress_cpu_lim, mem_lim=stress_mem_lim,
-            ))
+    if poller is not None:
+        stop_evt.set()
+        poller.join(timeout=10)
 
-    # Wait for stress pods to start
-    log("    Waiting for noise pods to start...")
-    for i in range(NOISE_TENANTS):
-        ns = ns_name(mode, i)
-        ok = wait_pods_running(ns, timeout=90)
-        log(f"    {ns}: {'Running' if ok else 'TIMEOUT'}")
+    # ── 5. Statistics ──────────────────────────────────────────────
+    per_victim_stats: Dict[str, Dict[str, Any]] = {}
+    for v in victims:
+        s = series.get(v.namespace, [])
+        lat = np.array([x[1] for x in s]) * 1000
+        if len(lat) == 0:
+            continue
+        per_victim_stats[v.namespace] = {
+            "role": v.role, "tier": v.tier, "idx": v.idx,
+            "n_samples": len(lat),
+            "mean_ms": float(np.mean(lat)),
+            "median_ms": float(np.median(lat)),
+            "p95_ms": float(np.percentile(lat, 95)),
+            "p99_ms": float(np.percentile(lat, 99)),
+            "std_ms": float(np.std(lat)),
+            "min_ms": float(np.min(lat)),
+            "max_ms": float(np.max(lat)),
+        }
 
-    # Warm-up period
-    log("    Warm-up (5s)...")
-    time.sleep(5)
-
-    # ── 5. Measure victim latency under stress ───────────────────
-    log(f"  [5/5] Measuring victim latency under stress ({STRESS_DURATION}s)...")
-    stress_latencies: List[float] = []
-    timestamps: List[float] = []
-    t_start = time.perf_counter()
-
-    sample_count = 0
-    while (time.perf_counter() - t_start) < STRESS_DURATION:
-        t_rel = time.perf_counter() - t_start
-        lat = measure_victim_latency(victim_ns)
-        timestamps.append(t_rel)
-        stress_latencies.append(lat)
-        sample_count += 1
-        if sample_count % 20 == 0:
-            log(f"    t={t_rel:.1f}s  latency={lat*1000:.1f}ms  "
-                f"(samples={sample_count})")
-        time.sleep(SAMPLE_INTERVAL)
-
-    # Statistics
-    lat_arr = np.array(stress_latencies) * 1000  # ms
-    stats = {
-        "mean_ms": float(np.mean(lat_arr)),
-        "median_ms": float(np.median(lat_arr)),
-        "p95_ms": float(np.percentile(lat_arr, 95)),
-        "p99_ms": float(np.percentile(lat_arr, 99)),
-        "std_ms": float(np.std(lat_arr)),      # Jitter
-        "min_ms": float(np.min(lat_arr)),
-        "max_ms": float(np.max(lat_arr)),
+    # Aggregate across all victims
+    flat_lat = np.concatenate([np.array([x[1] for x in s]) for s in series.values()
+                               if s]) * 1000 if any(series.values()) else np.array([0.0])
+    overall = {
+        "n_samples": int(len(flat_lat)),
+        "mean_ms": float(np.mean(flat_lat)),
+        "median_ms": float(np.median(flat_lat)),
+        "p95_ms": float(np.percentile(flat_lat, 95)),
+        "p99_ms": float(np.percentile(flat_lat, 99)),
+        "std_ms": float(np.std(flat_lat)),
     }
 
-    log(f"\n  Results ({mode.upper()}):")
-    log(f"    Samples       : {len(stress_latencies)}")
-    log(f"    Mean latency  : {stats['mean_ms']:.1f} ms")
-    log(f"    P95 latency   : {stats['p95_ms']:.1f} ms")
-    log(f"    P99 latency   : {stats['p99_ms']:.1f} ms")
-    log(f"    Jitter (σ)    : {stats['std_ms']:.1f} ms")
+    log(f"  Results — overall P95={overall['p95_ms']:.1f}ms, "
+        f"P99={overall['p99_ms']:.1f}ms, jitter={overall['std_ms']:.1f}ms")
 
-    pre_arr = np.array(pre_noise_latencies) * 1000
+    # Tier-broken stats (priority vs standard victims)
+    tier_stats: Dict[str, Dict[str, float]] = {}
+    for tier in ("priority", "standard"):
+        lats: List[float] = []
+        for v in victims:
+            if v.tier != tier:
+                continue
+            lats.extend([x[1] * 1000 for x in series.get(v.namespace, [])])
+        if lats:
+            arr = np.array(lats)
+            tier_stats[tier] = {
+                "n": int(len(arr)),
+                "mean_ms": float(np.mean(arr)),
+                "p95_ms": float(np.percentile(arr, 95)),
+                "p99_ms": float(np.percentile(arr, 99)),
+                "std_ms": float(np.std(arr)),
+            }
+
+    # ── Agentic-only extras ────────────────────────────────────────
+    agentic_data: Optional[Dict[str, Any]] = None
+    if poller is not None:
+        agentic_data = build_agentic_summary(poller, stress_t0_epoch)
+        log(f"  Operator audit: total actions="
+            f"{agentic_data['total_actions']}, "
+            f"new during stress={agentic_data['new_actions_during_stress']}, "
+            f"first-response="
+            f"{agentic_data['first_response_s']:.1f}s"
+            if agentic_data['first_response_s'] is not None
+            else "  Operator audit: no rebalance during stress")
+
+    # ── Cleanup ────────────────────────────────────────────────────
+    cleanup_exp3()
+
     return {
+        "scenario": scenario,
+        "scenario_name": SCENARIOS[scenario]["name"],
         "mode": mode,
-        "timestamps": timestamps,
-        "latencies_ms": lat_arr.tolist(),
-        "pre_noise_latencies_ms": pre_arr.tolist(),
-        "stats": stats,
-        "pre_noise_stats": {
-            "mean_ms": float(np.mean(pre_arr)),
-            "p95_ms": float(np.percentile(pre_arr, 95)),
-            "std_ms": float(np.std(pre_arr)),
-        },
-        "n_samples": len(stress_latencies),
+        "run_idx": run_idx,
+        "duration_s": duration,
+        "n_victims": len(victims),
+        "n_aggressors": len(aggressors),
+        "n_idle_bg": SCENARIOS[scenario]["idle_bg"],
+        "stress_t0_epoch": stress_t0_epoch,
+        "provisioning_s": prov_dt,
+        "pre_noise_per_victim_ms": {ns: [x * 1000 for x in vs]
+                                    for ns, vs in pre_noise.items()},
+        "series_per_victim": {ns: [(t, lat * 1000) for (t, lat) in s]
+                              for ns, s in series.items()},
+        "stats_per_victim": per_victim_stats,
+        "stats_overall": overall,
+        "stats_per_tier": tier_stats,
+        "agentic": agentic_data,
     }
 
 
-# ── Main ──────────────────────────────────────────────────────────────
+def build_agentic_summary(poller: AgenticPoller, stress_t0_epoch: float
+                          ) -> Dict[str, Any]:
+    """Aggregate the poller's snapshots into a compact summary."""
+    timeline: List[Dict[str, Any]] = []
+    seen_actions_count: Dict[str, int] = {}
+    new_action_events: List[Dict[str, Any]] = []
+    first_response_s: Optional[float] = None
 
-def main():
-    parser = argparse.ArgumentParser(description="Experiment 3: Hard Isolation")
-    parser.add_argument("--duration", type=int, default=40, help="Stress measurement duration (s)")
+    for snap in poller.snapshots:
+        timeline.append({
+            "t_rel_s": snap.t_rel,
+            "cs": snap.cs_name, "role": snap.role, "tier": snap.tier,
+            "phase": snap.phase,
+            "actions_len": snap.actions_len,
+            "last_updated_epoch": snap.last_updated_epoch,
+            "latest_action": snap.latest_action,
+        })
+        prev = seen_actions_count.get(snap.cs_name, 0)
+        if snap.actions_len > prev and snap.latest_action:
+            cat = _classify_action(snap.latest_action)
+            new_action_events.append({
+                "t_rel_s": snap.t_rel, "cs": snap.cs_name,
+                "role": snap.role, "tier": snap.tier,
+                "category": cat, "action": snap.latest_action,
+            })
+            if first_response_s is None and cat in ("reclaimed", "boosted"):
+                first_response_s = snap.t_rel
+        seen_actions_count[snap.cs_name] = snap.actions_len
+
+    counts: Dict[str, int] = {}
+    for ev in new_action_events:
+        counts[ev["category"]] = counts.get(ev["category"], 0) + 1
+
+    # Per-CR final action list
+    final_per_cr = poller.final
+    total_actions = sum(len(v["actions"]) for v in final_per_cr.values())
+
+    return {
+        "timeline": timeline,
+        "new_action_events": new_action_events,
+        "action_counts": counts,
+        "total_actions": total_actions,
+        "new_actions_during_stress": len(new_action_events),
+        "first_response_s": first_response_s,
+        "per_cr": final_per_cr,
+    }
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Experiment 3: Hard Isolation under Noisy Neighbors")
+    parser.add_argument("--scenarios", default="A,B,C")
+    parser.add_argument("--modes", default="baseline,manual,agentic")
+    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION)
+    parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--skip-apply", action="store_true")
+    parser.add_argument("--out", default="results/exp3_isolation_results.json")
     args = parser.parse_args()
 
-    global STRESS_DURATION
-    STRESS_DURATION = args.duration
-
+    scenarios = [s.strip().upper() for s in args.scenarios.split(",") if s.strip()]
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = RESULTS_DIR / "exp3_isolation_results.json"
+    out_path = SCRIPT_DIR / args.out
 
-    if not args.skip_apply:
+    if args.skip_apply:
+        log(f"Loading existing results from {out_path} ...")
+        with open(out_path) as f:
+            all_results = json.load(f)
+        log(f"  ({len(all_results)} records)")
+    else:
         log("=" * 70)
-        log("EXPERIMENT 3: Hard Isolation — Kernel-Level Interference Blocking")
+        log("EXPERIMENT 3 (redesigned): Hard Isolation under Noisy Neighbors")
         log("=" * 70)
-        log(f"  Noise tenants     : {NOISE_TENANTS} (CPU + I/O stress)")
-        log(f"  Victim tenant     : Tenant {VICTIM_IDX + 1}")
-        log(f"  Stress duration   : {STRESS_DURATION}s")
-        log(f"  Sample interval   : {SAMPLE_INTERVAL}s")
+        log(f"  Scenarios   : {scenarios}")
+        log(f"  Modes       : {modes}")
+        log(f"  Duration    : {args.duration}s")
+        log(f"  Runs        : {args.runs}")
+        log("=" * 70)
 
         all_results: List[Dict[str, Any]] = []
-
-        # ── Baseline ─────────────────────────────────────────────
-        cleanup_exp3()
-        time.sleep(2)
-        baseline = run_scenario("baseline")
-        all_results.append(baseline)
-        cleanup_exp3()
-        time.sleep(3)
-
-        # ── Operator ─────────────────────────────────────────────
-        operator = run_scenario("operator")
-        all_results.append(operator)
-        cleanup_exp3()
+        total = len(scenarios) * len(modes) * args.runs
+        idx = 0
+        for sc in scenarios:
+            for mode in modes:
+                for run_idx in range(args.runs):
+                    idx += 1
+                    log(f"\n[{idx}/{total}]")
+                    rec = run_one(sc, mode, args.duration, run_idx)
+                    all_results.append(rec)
 
         with open(out_path, "w") as f:
             json.dump(all_results, f, indent=2)
-        log(f"\n✓ Results saved to {out_path}")
+        log(f"\n✓ Raw results saved to {out_path}")
 
-    else:
-        log(f"Loading results from {out_path} ...")
-        with open(out_path) as f:
-            all_results = json.load(f)
-
-    # ── Summary ──────────────────────────────────────────────────
+    # ── Summary table ───────────────────────────────────────────────
     log("\n" + "=" * 70)
-    log("COMPARISON SUMMARY")
+    log("SUMMARY  (overall, averaged across runs)")
     log("=" * 70)
+    log(f"  {'Scen':<6}{'Mode':<10}{'P50':>8}{'P95':>8}{'P99':>8}{'σ':>8}{'  Operator':<14}")
+    by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for r in all_results:
+        by_key.setdefault((r["scenario"], r["mode"]), []).append(r)
+    for (sc, mode) in sorted(by_key.keys()):
+        recs = by_key[(sc, mode)]
+        p50 = np.mean([r["stats_overall"]["median_ms"] for r in recs])
+        p95 = np.mean([r["stats_overall"]["p95_ms"] for r in recs])
+        p99 = np.mean([r["stats_overall"]["p99_ms"] for r in recs])
+        std = np.mean([r["stats_overall"]["std_ms"] for r in recs])
+        op_info = ""
+        if mode == "agentic":
+            firsts = [r["agentic"]["first_response_s"] for r in recs
+                      if r.get("agentic") and r["agentic"]["first_response_s"] is not None]
+            new_actions = np.mean([r["agentic"]["new_actions_during_stress"]
+                                   for r in recs if r.get("agentic")])
+            op_info = (f"resp={np.mean(firsts):.1f}s," if firsts else "resp=n/a, "
+                      ) + f"#={new_actions:.0f}"
+        log(f"  {sc:<6}{mode:<10}{p50:>8.1f}{p95:>8.1f}{p99:>8.1f}{std:>8.1f}  {op_info}")
 
-    for rec in all_results:
-        mode = rec["mode"].upper()
-        s = rec["stats"]
-        log(f"\n  [{mode}]")
-        log(f"    Mean   : {s['mean_ms']:.1f} ms")
-        log(f"    P95    : {s['p95_ms']:.1f} ms")
-        log(f"    P99    : {s['p99_ms']:.1f} ms")
-        log(f"    Jitter : {s['std_ms']:.1f} ms")
-
-    if len(all_results) == 2:
-        b, o = all_results[0]["stats"], all_results[1]["stats"]
-        p95_improvement = ((b["p95_ms"] - o["p95_ms"]) / b["p95_ms"]) * 100
-        jitter_improvement = ((b["std_ms"] - o["std_ms"]) / b["std_ms"]) * 100
-        log(f"\n  ★ Operator vs Baseline:")
-        log(f"    P95 improvement   : {p95_improvement:+.1f}%")
-        log(f"    Jitter reduction  : {jitter_improvement:+.1f}%")
-
-    log("\n✓ Experiment 3 complete. Run plot_isolation.py to generate figures.")
+    log("\n✓ Run plot_isolation.py and plot_agentic_analysis.py.")
     return 0
 
 

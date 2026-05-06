@@ -12,11 +12,19 @@ spec:
     listKind: ChatSpaceList
     plural: chatspaces
     singular: chatspace
+    shortNames:
+    - cs
   scope: Cluster
   versions:
-  - additionalPrinterColumns:
+  - name: v1
+    served: true
+    storage: true
+    additionalPrinterColumns:
     - jsonPath: .spec.tenantId
       name: Tenant
+      type: string
+    - jsonPath: .spec.tier
+      name: Tier
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -27,362 +35,133 @@ spec:
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
-    name: v1
     schema:
       openAPIV3Schema:
-        description: ChatSpace is the Schema for the chatspaces API
+        description: |
+          ChatSpace is the Schema for the chatspaces API. It represents a tenant
+          managed by the Agentic Operator: declaring a ChatSpace causes the
+          Operator to autonomously provision a Namespace, ResourceQuota,
+          LimitRange, and (optionally) NetworkPolicy, and to continuously
+          re-balance quotas across all tenants.
+        type: object
         properties:
-          apiVersion:
-            description: 'APIVersion defines the versioned schema of this representation
-              of an object. Servers should convert recognized schemas to the latest
-              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
-            type: string
-          kind:
-            description: 'Kind is a string value representing the REST resource this
-              object represents. Servers may infer this from the endpoint the client
-              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
-            type: string
-          metadata:
-            type: object
+          apiVersion: { type: string }
+          kind: { type: string }
+          metadata: { type: object }
           spec:
-            description: ChatSpaceSpec defines the desired state of ChatSpace
-            properties:
-              departmentCode:
-                description: DepartmentCode는 학교 부서 코드
-                type: string
-              displayName:
-                description: DisplayName은 테넌트 표시 이름
-                type: string
-              embedding:
-                description: Embedding Worker 설정
-                properties:
-                  chunkSize:
-                    default: 512
-                    description: ChunkSize는 청크 크기 (토큰 단위)
-                    format: int32
-                    maximum: 2048
-                    minimum: 128
-                    type: integer
-                  embeddingApiUrl:
-                    default: https://api.openai.com/v1/embeddings
-                    description: EmbeddingAPIURL은 임베딩 API 엔드포인트
-                    type: string
-                  enabled:
-                    default: true
-                    description: Enabled는 Embedding Worker 배포 여부
-                    type: boolean
-                  model:
-                    default: text-embedding-ada-002
-                    description: Model은 임베딩 모델
-                    type: string
-                  replicas:
-                    default: 1
-                    description: Replicas는 Worker 인스턴스 수
-                    format: int32
-                    maximum: 10
-                    minimum: 1
-                    type: integer
-                required:
-                - enabled
-                type: object
-              outline:
-                description: Outline Wiki 설정
-                properties:
-                  enabled:
-                    default: true
-                    description: Enabled는 Outline 배포 여부
-                    type: boolean
-                  image:
-                    default: outlinewiki/outline:latest
-                    description: Image는 Outline 컨테이너 이미지
-                    type: string
-                  replicas:
-                    default: 1
-                    description: Replicas는 Outline 인스턴스 수
-                    format: int32
-                    maximum: 5
-                    minimum: 1
-                    type: integer
-                  storageSize:
-                    default: 10Gi
-                    description: StorageSize는 PostgreSQL 스토리지 크기
-                    type: string
-                  webhookUrl:
-                    description: WebhookURL은 Embedding Worker Webhook 엔드포인트
-                    type: string
-                required:
-                - enabled
-                type: object
-              qdrant:
-                description: Qdrant Vector DB 설정
-                properties:
-                  collectionName:
-                    description: CollectionName은 벡터 컬렉션 이름
-                    type: string
-                  enabled:
-                    default: true
-                    description: Enabled는 Qdrant 배포 여부
-                    type: boolean
-                  storageSize:
-                    default: 20Gi
-                    description: StorageSize는 Qdrant 데이터 스토리지 크기
-                    type: string
-                  vectorSize:
-                    default: 1536
-                    description: VectorSize는 임베딩 벡터 차원
-                    format: int32
-                    maximum: 4096
-                    minimum: 128
-                    type: integer
-                required:
-                - enabled
-                type: object
-              rag:
-                description: RAG API 설정
-                properties:
-                  enabled:
-                    default: true
-                    description: Enabled는 RAG API 배포 여부
-                    type: boolean
-                  llmUrl:
-                    default: https://api.openai.com/v1/chat/completions
-                    description: LLMURL은 LLM API 엔드포인트
-                    type: string
-                  model:
-                    default: gpt-4-turbo
-                    description: Model은 LLM 모델
-                    type: string
-                  replicas:
-                    default: 2
-                    description: Replicas는 API 인스턴스 수
-                    format: int32
-                    maximum: 10
-                    minimum: 1
-                    type: integer
-                  topK:
-                    default: 5
-                    description: TopK는 검색할 문서 수
-                    format: int32
-                    maximum: 20
-                    minimum: 1
-                    type: integer
-                required:
-                - enabled
-                type: object
-              resourceQuota:
-                description: 리소스 할당량
-                properties:
-                  cpu:
-                    default: "4"
-                    description: 'CPU 요청/제한 (예: "2", "500m")'
-                    type: string
-                  maxPods:
-                    default: 20
-                    description: 최대 Pod 수
-                    format: int32
-                    type: integer
-                  memory:
-                    default: 8Gi
-                    description: 'Memory 요청/제한 (예: "4Gi", "512Mi")'
-                    type: string
-                  storage:
-                    default: 50Gi
-                    description: 스토리지 제한
-                    type: string
-                type: object
-              tenantId:
-                description: 'TenantID는 테넌트 고유 식별자 (예: cs-dept, admin-office)'
-                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                type: string
-            required:
-            - displayName
-            - tenantId
             type: object
-          status:
-            description: ChatSpaceStatus defines the observed state of ChatSpace
+            required: [tenantId]
             properties:
-              conditions:
-                description: Conditions는 상세 상태 목록
-                items:
-                  description: "Condition contains details for one aspect of the current
-                    state of this API Resource. --- This struct is intended for direct
-                    use as an array at the field path .status.conditions.  For example,
-                    \n type FooStatus struct{ // Represents the observations of a
-                    foo's current state. // Known .status.conditions.type are: \"Available\",
-                    \"Progressing\", and \"Degraded\" // +patchMergeKey=type // +patchStrategy=merge
-                    // +listType=map // +listMapKey=type Conditions []metav1.Condition
-                    `json:\"conditions,omitempty\" patchStrategy:\"merge\" patchMergeKey:\"type\"
-                    protobuf:\"bytes,1,rep,name=conditions\"` \n // other fields }"
-                  properties:
-                    lastTransitionTime:
-                      description: lastTransitionTime is the last time the condition
-                        transitioned from one status to another. This should be when
-                        the underlying condition changed.  If that is not known, then
-                        using the time when the API field changed is acceptable.
-                      format: date-time
-                      type: string
-                    message:
-                      description: message is a human readable message indicating
-                        details about the transition. This may be an empty string.
-                      maxLength: 32768
-                      type: string
-                    observedGeneration:
-                      description: observedGeneration represents the .metadata.generation
-                        that the condition was set based upon. For instance, if .metadata.generation
-                        is currently 12, but the .status.conditions[x].observedGeneration
-                        is 9, the condition is out of date with respect to the current
-                        state of the instance.
-                      format: int64
-                      minimum: 0
-                      type: integer
-                    reason:
-                      description: reason contains a programmatic identifier indicating
-                        the reason for the condition's last transition. Producers
-                        of specific condition types may define expected values and
-                        meanings for this field, and whether the values are considered
-                        a guaranteed API. The value should be a CamelCase string.
-                        This field may not be empty.
-                      maxLength: 1024
-                      minLength: 1
-                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-                      type: string
-                    status:
-                      description: status of the condition, one of True, False, Unknown.
-                      enum:
-                      - "True"
-                      - "False"
-                      - Unknown
-                      type: string
-                    type:
-                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
-                        --- Many .condition.type values are consistent across resources
-                        like Available, but because arbitrary conditions can be useful
-                        (see .node.status.conditions), the ability to deconflict is
-                        important. The regex it matches is (dns1123SubdomainFmt/)?(qualifiedNameFmt)
-                      maxLength: 316
-                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-                      type: string
-                  required:
-                  - lastTransitionTime
-                  - message
-                  - reason
-                  - status
-                  - type
-                  type: object
-                type: array
-              lastUpdated:
-                description: LastUpdated는 마지막 업데이트 시각
-                format: date-time
+              tenantId:
+                description: Unique identifier for the tenant.
+                type: string
+              tier:
+                description: Tenant tier; drives default quota and isolation policy.
+                type: string
+                enum: [priority, standard, internal]
+                default: standard
+              owner:
+                description: Owner email or team — purely informational.
+                type: string
+              resourceQuota:
+                description: |
+                  Optional overrides for the tier defaults. Empty fields fall back
+                  to the Operator's tier-based defaults.
+                type: object
+                properties:
+                  cpuRequests: { type: string }
+                  memoryRequests: { type: string }
+                  cpuLimits: { type: string }
+                  memoryLimits: { type: string }
+                  maxPods: { type: integer, format: int32 }
+              agentic:
+                description: |
+                  Configures the autonomous decision-making behavior of the Operator.
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                    default: true
+                  hardIsolation:
+                    type: boolean
+                    default: true
+                  reclaimIdleAfterSeconds:
+                    type: integer
+                    format: int32
+                    default: 120
+                  activeBoostFactor:
+                    type: string
+                    default: "1.5"
+              outline:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  storageSize: { type: string }
+              qdrant:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  collectionName: { type: string }
+              embedding:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  model: { type: string }
+              rag:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  model: { type: string }
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+                enum: [Pending, Provisioning, Ready, Rebalancing, Failed]
+              message:
                 type: string
               namespace:
-                description: Namespace는 생성된 테넌트 Namespace
                 type: string
-              observedGeneration:
-                description: ObservedGeneration은 관찰된 세대
-                format: int64
-                type: integer
-              outlineUrl:
-                description: OutlineURL은 Outline Wiki 접근 URL
-                type: string
-              phase:
-                description: Phase는 ChatSpace 상태 (Pending, Creating, Ready, Failed)
-                enum:
-                - Pending
-                - Creating
-                - Ready
-                - Failed
-                - Deleting
-                type: string
-              ragUrl:
-                description: RAGURL은 RAG API 접근 URL
-                type: string
-              resourceStatus:
-                description: ResourceStatus는 각 리소스 상태
-                properties:
-                  embedding:
-                    description: Embedding Worker 상태
-                    properties:
-                      message:
-                        description: Message는 상태 메시지
-                        type: string
-                      ready:
-                        description: Ready는 준비 상태
-                        type: boolean
-                      readyReplicas:
-                        description: ReadyReplicas는 준비된 레플리카 수
-                        format: int32
-                        type: integer
-                      totalReplicas:
-                        description: TotalReplicas는 전체 레플리카 수
-                        format: int32
-                        type: integer
-                    required:
-                    - ready
-                    type: object
-                  outline:
-                    description: Outline 상태
-                    properties:
-                      message:
-                        description: Message는 상태 메시지
-                        type: string
-                      ready:
-                        description: Ready는 준비 상태
-                        type: boolean
-                      readyReplicas:
-                        description: ReadyReplicas는 준비된 레플리카 수
-                        format: int32
-                        type: integer
-                      totalReplicas:
-                        description: TotalReplicas는 전체 레플리카 수
-                        format: int32
-                        type: integer
-                    required:
-                    - ready
-                    type: object
-                  qdrant:
-                    description: Qdrant 상태
-                    properties:
-                      message:
-                        description: Message는 상태 메시지
-                        type: string
-                      ready:
-                        description: Ready는 준비 상태
-                        type: boolean
-                      readyReplicas:
-                        description: ReadyReplicas는 준비된 레플리카 수
-                        format: int32
-                        type: integer
-                      totalReplicas:
-                        description: TotalReplicas는 전체 레플리카 수
-                        format: int32
-                        type: integer
-                    required:
-                    - ready
-                    type: object
-                  rag:
-                    description: RAG API 상태
-                    properties:
-                      message:
-                        description: Message는 상태 메시지
-                        type: string
-                      ready:
-                        description: Ready는 준비 상태
-                        type: boolean
-                      readyReplicas:
-                        description: ReadyReplicas는 준비된 레플리카 수
-                        format: int32
-                        type: integer
-                      totalReplicas:
-                        description: TotalReplicas는 전체 레플리카 수
-                        format: int32
-                        type: integer
-                    required:
-                    - ready
-                    type: object
+              appliedQuota:
                 type: object
-            type: object
-        type: object
-    served: true
-    storage: true
+                properties:
+                  cpuRequests: { type: string }
+                  memoryRequests: { type: string }
+                  cpuLimits: { type: string }
+                  memoryLimits: { type: string }
+                  maxPods: { type: integer, format: int32 }
+              agenticActions:
+                description: Recent autonomous decisions made by the Operator.
+                type: array
+                items: { type: string }
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required: [type, status, lastTransitionTime, reason, message]
+                  properties:
+                    type: { type: string }
+                    status: { type: string, enum: ["True", "False", Unknown] }
+                    lastTransitionTime: { type: string, format: date-time }
+                    reason: { type: string }
+                    message: { type: string }
+                    observedGeneration: { type: integer, format: int64 }
+              resourceStatus:
+                type: object
+                properties:
+                  outline: &compStatus
+                    type: object
+                    properties:
+                      ready: { type: boolean }
+                      message: { type: string }
+                  qdrant: *compStatus
+                  embedding: *compStatus
+                  rag: *compStatus
+              lastUpdated:
+                type: string
+                format: date-time
+              observedGeneration:
+                type: integer
+                format: int64
     subresources:
       status: {}

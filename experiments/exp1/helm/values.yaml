@@ -1,0 +1,22 @@
+# Default values for the kcu-tenant chart.
+# Mirrored from the Agentic Operator's `standard` tier so Helm and
+# Operator paths produce equivalent end-states.
+
+tenantId: ""           # Required; e.g. "cs-dept"
+tier: "standard"       # priority | standard | internal — informational
+
+quota:
+  cpuRequests: "500m"
+  memoryRequests: "512Mi"
+  cpuLimits: "1"
+  memoryLimits: "1Gi"
+  maxPods: 10
+
+limitRange:
+  cpuDefault: "200m"
+  memoryDefault: "128Mi"
+  cpuRequest: "50m"
+  memoryRequest: "64Mi"
+
+networkPolicy:
+  enabled: true       # Hard cross-tenant isolation

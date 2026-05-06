@@ -1,5 +1,6 @@
-# Image URL to use all building/pushing image targets
-IMG ?= knowledge-portal-operator:latest
+# Image URL to use all building/pushing image targets.
+# Default matches the image in config/manager/manager.yaml.
+IMG ?= kcu/portal-operator:local
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -68,12 +69,16 @@ uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube
 	kubectl delete -f config/crd/bases
 
 .PHONY: deploy
-deploy: manifests ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && kubectl apply -f manager.yaml
+deploy: ## Deploy controller (CRD + RBAC + Operator) to the K8s cluster.
+	kubectl apply -f config/crd/bases/portal.kcu.ac.kr_chatspaces.yaml
+	kubectl apply -f config/rbac/role.yaml
+	kubectl apply -f config/manager/manager.yaml
 
 .PHONY: undeploy
-undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
-	cd config/manager && kubectl delete -f manager.yaml
+undeploy: ## Undeploy controller from the K8s cluster.
+	kubectl delete -f config/manager/manager.yaml --ignore-not-found
+	kubectl delete -f config/rbac/role.yaml --ignore-not-found
+	kubectl delete -f config/crd/bases/portal.kcu.ac.kr_chatspaces.yaml --ignore-not-found
 
 ##@ Build Dependencies
 

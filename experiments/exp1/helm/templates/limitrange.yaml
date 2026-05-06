@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tenant-limits
+  namespace: {{ include "kcu-tenant.namespace" . }}
+  labels:
+    {{- include "kcu-tenant.labels" . | nindent 4 }}
+spec:
+  limits:
+  - type: Container
+    default:
+      cpu: {{ .Values.limitRange.cpuDefault | quote }}
+      memory: {{ .Values.limitRange.memoryDefault | quote }}
+    defaultRequest:
+      cpu: {{ .Values.limitRange.cpuRequest | quote }}
+      memory: {{ .Values.limitRange.memoryRequest | quote }}
