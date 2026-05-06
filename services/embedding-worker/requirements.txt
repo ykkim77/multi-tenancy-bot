@@ -1,0 +1,9 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+openai==0.28.1
+qdrant-client==1.7.0
+langchain==0.0.350
+tenacity==8.2.3
+python-multipart==0.0.6

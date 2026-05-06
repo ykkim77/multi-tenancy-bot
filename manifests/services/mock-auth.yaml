@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-auth
+  namespace: kcu-system
+  labels:
+    app: mock-auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-auth
+  template:
+    metadata:
+      labels:
+        app: mock-auth
+    spec:
+      containers:
+      - name: mock-auth
+        image: python:3.11-slim
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash"]
+        args: ["-c", "pip install fastapi uvicorn pyjwt python-multipart && python /app/main.py"]
+        ports:
+        - containerPort: 8000
+        env:
+        - name: JWT_SECRET
+          value: "dev-secret-key-change-in-production"
+        volumeMounts:
+        - name: mock-auth-code
+          mountPath: /app
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 5
+      volumes:
+      - name: mock-auth-code
+        configMap:
+          name: mock-auth-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-auth
+  namespace: kcu-system
+  labels:
+    app: mock-auth
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+  selector:
+    app: mock-auth

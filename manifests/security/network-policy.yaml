@@ -1,0 +1,44 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tenant-isolation
+  namespace: tenant-test-dept
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # 같은 namespace 내 통신 허용
+  - from:
+    - podSelector: {}
+  
+  egress:
+  # 같은 namespace 내 통신 허용
+  - to:
+    - podSelector: {}
+  
+  # Auth Gateway (kcu-system) 접속 허용
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kcu-system
+      podSelector:
+        matchLabels:
+          app: auth-gateway
+    ports:
+    - protocol: TCP
+      port: 8000
+  
+  # DNS 허용
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53

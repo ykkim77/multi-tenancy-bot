@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-TENANT_ID
+  labels:
+    tenant: TENANT_ID
+    name: tenant-TENANT_ID
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tenant-secrets
+  namespace: tenant-TENANT_ID
+type: Opaque
+stringData:
+  OUTLINE_SECRET_KEY: "changeme-outline-secret-key-32-chars"
+  OUTLINE_UTILS_SECRET: "changeme-outline-utils-secret-32"
+  POSTGRES_PASSWORD: "outline-pass"
+  REDIS_PASSWORD: "redis-pass"
+  EMBEDDING_API_KEY: "sk-YOUR-OPENAI-API-KEY"
+  LLM_API_KEY: "sk-YOUR-OPENAI-API-KEY"

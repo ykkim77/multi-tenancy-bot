@@ -1,0 +1,289 @@
+# Outline Wiki Application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outline
+  namespace: tenant-test-dept
+  labels:
+    app: outline
+    tenant: test-dept
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: outline
+      tenant: test-dept
+  template:
+    metadata:
+      labels:
+        app: outline
+        tenant: test-dept
+    spec:
+      serviceAccountName: tenant-sa
+      containers:
+      - name: outline
+        image: outlinewiki/outline:0.75.2
+        ports:
+        - containerPort: 3000
+        env:
+        # 기본 설정
+        - name: NODE_ENV
+          value: production
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tenant-secrets
+              key: OUTLINE_SECRET_KEY
+        - name: UTILS_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: tenant-secrets
+              key: OUTLINE_UTILS_SECRET
+        
+        # 데이터베이스
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: tenant-secrets
+              key: POSTGRES_PASSWORD
+        - name: DATABASE_URL
+          value: "postgres://outline:outline-pass@outline-postgres:5432/outline"
+        - name: PGSSLMODE
+          value: disable
+        
+        # Redis
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: tenant-secrets
+              key: REDIS_PASSWORD
+        - name: REDIS_URL
+          value: "redis://:$(REDIS_PASSWORD)@outline-redis:6379"
+        
+        # URL/Host 설정
+        - name: URL
+          value: "http://localhost:3000"
+        - name: HOST
+          value: "0.0.0.0"
+        - name: PORT
+          value: "3000"
+        - name: FORCE_HTTPS
+          value: "false"
+        - name: ENABLE_UPDATES
+          value: "false"
+        
+        # 포털 타이틀 (고정)
+        - name: TEAM_NAME
+          value: "KCU 지식포털"
+        
+        # Webhook 설정
+        - name: WEBHOOK_URL
+          value: "http://embedding-worker:8000/webhook/outline"
+        - name: ALLOWED_PRIVATE_IPS
+          value: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+        
+        # OIDC Authentication with Auth Gateway
+        - name: OIDC_CLIENT_ID
+          value: "outline-client"
+        - name: OIDC_CLIENT_SECRET
+          value: "outline-secret"
+        - name: OIDC_AUTH_URI
+          value: "http://localhost:8000/auth/login"
+        - name: OIDC_TOKEN_URI
+          value: "http://auth-gateway.kcu-system.svc.cluster.local:8000/auth/token"
+        - name: OIDC_USERINFO_URI
+          value: "http://auth-gateway.kcu-system.svc.cluster.local:8000/auth/me"
+        - name: OIDC_DISPLAY_NAME
+          value: "KCU SSO"
+        
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        
+        volumeMounts:
+        - name: outline-data
+          mountPath: /var/lib/outline/data
+      
+      volumes:
+      - name: outline-data
+        persistentVolumeClaim:
+          claimName: outline-data
+
+---
+# Outline Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: outline
+  namespace: tenant-test-dept
+  labels:
+    app: outline
+spec:
+  selector:
+    app: outline
+    tenant: test-dept
+  ports:
+  - port: 80
+    targetPort: 3000
+    protocol: TCP
+  type: ClusterIP
+
+---
+# PostgreSQL for Outline
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: outline-postgres
+  namespace: tenant-test-dept
+  labels:
+    app: outline-postgres
+spec:
+  serviceName: outline-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: outline-postgres
+  template:
+    metadata:
+      labels:
+        app: outline-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          value: outline
+        - name: POSTGRES_PASSWORD
+          value: outline-pass
+        - name: POSTGRES_DB
+          value: outline
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: outline-postgres
+  namespace: tenant-test-dept
+  labels:
+    app: outline-postgres
+spec:
+  selector:
+    app: outline-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+    protocol: TCP
+  clusterIP: None
+
+---
+# Redis for Outline
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outline-redis
+  namespace: tenant-test-dept
+  labels:
+    app: outline-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: outline-redis
+      tenant: test-dept
+  template:
+    metadata:
+      labels:
+        app: outline-redis
+        tenant: test-dept
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        command:
+        - redis-server
+        - --requirepass
+        - redis-pass
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: outline-redis
+  namespace: tenant-test-dept
+  labels:
+    app: outline-redis
+spec:
+  selector:
+    app: outline-redis
+    tenant: test-dept
+  ports:
+  - port: 6379
+    targetPort: 6379
+    protocol: TCP
+  type: ClusterIP
+
+---
+# PVC for Outline
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: outline-data
+  namespace: tenant-test-dept
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

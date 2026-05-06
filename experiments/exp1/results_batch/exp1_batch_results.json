@@ -1,0 +1,434 @@
+[
+  {
+    "mode": "manual",
+    "batch_size": 5,
+    "complexity": 1,
+    "run_idx": 0,
+    "batch_id": 1,
+    "times": [
+      0.0,
+      1.8938486240804195
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 1.8937900210730731,
+    "total_time": 1.8938486240804195,
+    "auc": 94.69243120402098
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 5,
+    "complexity": 1,
+    "run_idx": 0,
+    "batch_id": 2,
+    "times": [
+      0.0,
+      0.3994475288782269
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.3993846259545535,
+    "total_time": 0.3994475288782269,
+    "auc": 19.972376443911344
+  },
+  {
+    "mode": "manual",
+    "batch_size": 5,
+    "complexity": 1,
+    "run_idx": 1,
+    "batch_id": 3,
+    "times": [
+      0.0,
+      1.893455313052982
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 1.8933664090000093,
+    "total_time": 1.893455313052982,
+    "auc": 94.6727656526491
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 5,
+    "complexity": 1,
+    "run_idx": 1,
+    "batch_id": 4,
+    "times": [
+      0.0,
+      0.3847934198565781
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.3847360168583691,
+    "total_time": 0.3847934198565781,
+    "auc": 19.239670992828906
+  },
+  {
+    "mode": "manual",
+    "batch_size": 5,
+    "complexity": 2,
+    "run_idx": 0,
+    "batch_id": 5,
+    "times": [
+      0.0,
+      3.2738204849883914
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 3.2737487831618637,
+    "total_time": 3.2738204849883914,
+    "auc": 163.69102424941957
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 5,
+    "complexity": 2,
+    "run_idx": 0,
+    "batch_id": 6,
+    "times": [
+      0.0,
+      0.572096599964425
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.5720445970073342,
+    "total_time": 0.572096599964425,
+    "auc": 28.60482999822125
+  },
+  {
+    "mode": "manual",
+    "batch_size": 5,
+    "complexity": 2,
+    "run_idx": 1,
+    "batch_id": 7,
+    "times": [
+      0.0,
+      3.2477850429713726
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 3.2477282399777323,
+    "total_time": 3.2477850429713726,
+    "auc": 162.38925214856863
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 5,
+    "complexity": 2,
+    "run_idx": 1,
+    "batch_id": 8,
+    "times": [
+      0.0,
+      0.595349116018042
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.5952943139709532,
+    "total_time": 0.595349116018042,
+    "auc": 29.7674558009021
+  },
+  {
+    "mode": "manual",
+    "batch_size": 5,
+    "complexity": 3,
+    "run_idx": 0,
+    "batch_id": 9,
+    "times": [
+      0.0,
+      4.451325861969963
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 4.451270659919828,
+    "total_time": 4.451325861969963,
+    "auc": 222.56629309849814
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 5,
+    "complexity": 3,
+    "run_idx": 0,
+    "batch_id": 10,
+    "times": [
+      0.0,
+      0.7387429568916559
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.7386825550347567,
+    "total_time": 0.7387429568916559,
+    "auc": 36.937147844582796
+  },
+  {
+    "mode": "manual",
+    "batch_size": 5,
+    "complexity": 3,
+    "run_idx": 1,
+    "batch_id": 11,
+    "times": [
+      0.0,
+      4.3701829828787595
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 4.370115980040282,
+    "total_time": 4.3701829828787595,
+    "auc": 218.50914914393798
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 5,
+    "complexity": 3,
+    "run_idx": 1,
+    "batch_id": 12,
+    "times": [
+      0.0,
+      0.8870310180354863
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.8869643150828779,
+    "total_time": 0.8870310180354863,
+    "auc": 44.35155090177432
+  },
+  {
+    "mode": "manual",
+    "batch_size": 10,
+    "complexity": 1,
+    "run_idx": 0,
+    "batch_id": 13,
+    "times": [
+      0.0,
+      3.8127189020160586
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 3.8126338981091976,
+    "total_time": 3.8127189020160586,
+    "auc": 190.63594510080293
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 10,
+    "complexity": 1,
+    "run_idx": 0,
+    "batch_id": 14,
+    "times": [
+      0.0,
+      0.7117095200810581
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.7116418171208352,
+    "total_time": 0.7117095200810581,
+    "auc": 35.58547600405291
+  },
+  {
+    "mode": "manual",
+    "batch_size": 10,
+    "complexity": 1,
+    "run_idx": 1,
+    "batch_id": 15,
+    "times": [
+      0.0,
+      3.8730065159033984
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 3.872952012810856,
+    "total_time": 3.8730065159033984,
+    "auc": 193.65032579516992
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 10,
+    "complexity": 1,
+    "run_idx": 1,
+    "batch_id": 16,
+    "times": [
+      0.0,
+      0.6715443129651248
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 0.671468110056594,
+    "total_time": 0.6715443129651248,
+    "auc": 33.57721564825624
+  },
+  {
+    "mode": "manual",
+    "batch_size": 10,
+    "complexity": 2,
+    "run_idx": 0,
+    "batch_id": 17,
+    "times": [
+      0.0,
+      6.289550194051117
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 6.2894951910711825,
+    "total_time": 6.289550194051117,
+    "auc": 314.47750970255584
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 10,
+    "complexity": 2,
+    "run_idx": 0,
+    "batch_id": 18,
+    "times": [
+      0.0,
+      1.031478774966672
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 1.0314272718969733,
+    "total_time": 1.031478774966672,
+    "auc": 51.5739387483336
+  },
+  {
+    "mode": "manual",
+    "batch_size": 10,
+    "complexity": 2,
+    "run_idx": 1,
+    "batch_id": 19,
+    "times": [
+      0.0,
+      6.365948734106496
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 6.365891331108287,
+    "total_time": 6.365948734106496,
+    "auc": 318.2974367053248
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 10,
+    "complexity": 2,
+    "run_idx": 1,
+    "batch_id": 20,
+    "times": [
+      0.0,
+      1.0930304839275777
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 1.0929563799872994,
+    "total_time": 1.0930304839275777,
+    "auc": 54.65152419637889
+  },
+  {
+    "mode": "manual",
+    "batch_size": 10,
+    "complexity": 3,
+    "run_idx": 0,
+    "batch_id": 21,
+    "times": [
+      0.0,
+      8.741382475942373
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 8.74128797207959,
+    "total_time": 8.741382475942373,
+    "auc": 437.06912379711866
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 10,
+    "complexity": 3,
+    "run_idx": 0,
+    "batch_id": 22,
+    "times": [
+      0.0,
+      1.4542637618724257
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 1.454210659954697,
+    "total_time": 1.4542637618724257,
+    "auc": 72.71318809362128
+  },
+  {
+    "mode": "manual",
+    "batch_size": 10,
+    "complexity": 3,
+    "run_idx": 1,
+    "batch_id": 23,
+    "times": [
+      0.0,
+      8.886423883028328
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 8.886366880033165,
+    "total_time": 8.886423883028328,
+    "auc": 444.3211941514164
+  },
+  {
+    "mode": "agentic",
+    "batch_size": 10,
+    "complexity": 3,
+    "run_idx": 1,
+    "batch_id": 24,
+    "times": [
+      0.0,
+      1.4790566670708358
+    ],
+    "success_rates": [
+      0.0,
+      100.0
+    ],
+    "apply_time": 1.4789913641288877,
+    "total_time": 1.4790566670708358,
+    "auc": 73.95283335354179
+  }
+]

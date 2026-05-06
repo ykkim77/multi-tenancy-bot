@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embedding-worker
+  namespace: tenant-test-dept
+  labels:
+    app: embedding-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: embedding-worker
+  template:
+    metadata:
+      labels:
+        app: embedding-worker
+    spec:
+      containers:
+      - name: embedding-worker
+        image: kcu/embedding-worker:local
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        - name: EMBEDDING_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tenant-secrets
+              key: EMBEDDING_API_KEY
+        - name: EMBEDDING_MODEL
+          value: "text-embedding-ada-002"
+        - name: QDRANT_URL
+          value: "http://qdrant:6333"
+        - name: QDRANT_COLLECTION
+          value: "kcu-knowledge"
+        - name: CHUNK_SIZE
+          value: "500"
+        - name: CHUNK_OVERLAP
+          value: "50"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: embedding-worker
+  namespace: tenant-test-dept
+  labels:
+    app: embedding-worker
+spec:
+  selector:
+    app: embedding-worker
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+  type: ClusterIP

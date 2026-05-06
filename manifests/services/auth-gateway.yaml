@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-gateway
+  namespace: kcu-system
+  labels:
+    app: auth-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-gateway
+  template:
+    metadata:
+      labels:
+        app: auth-gateway
+    spec:
+      containers:
+      - name: auth-gateway
+        image: auth-gateway:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        - name: AUTH_MODE
+          value: "DEV"
+        - name: DEFAULT_USER_ID
+          value: "admin@kcu.ac.kr"
+        - name: DEFAULT_USER_NAME
+          value: "관리자"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-gateway
+  namespace: kcu-system
+  labels:
+    app: auth-gateway
+spec:
+  selector:
+    app: auth-gateway
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+  type: ClusterIP

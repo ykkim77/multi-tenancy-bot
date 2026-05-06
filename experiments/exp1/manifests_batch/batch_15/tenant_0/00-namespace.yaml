@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: exp1b-b15-t0-c1
+  labels:
+    tenant: exp1-batch
+    batch_id: "15"
+    tenant_idx: "0"
+    complexity: "1"

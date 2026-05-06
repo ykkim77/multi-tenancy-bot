@@ -1,0 +1,7 @@
+{
+  "test": "Mann-Whitney U",
+  "p_value": 3.6584553538971e-05,
+  "significant": true,
+  "mean_auc_manual": 237.91437089579026,
+  "mean_auc_agentic": 41.743934002200454
+}

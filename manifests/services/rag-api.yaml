@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-api
+  namespace: tenant-test-dept
+  labels:
+    app: rag-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-api
+  template:
+    metadata:
+      labels:
+        app: rag-api
+    spec:
+      containers:
+      - name: rag-api
+        image: kcu/rag-api:local
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        env:
+        - name: EMBEDDING_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tenant-secrets
+              key: EMBEDDING_API_KEY
+        - name: LLM_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tenant-secrets
+              key: LLM_API_KEY
+        - name: QDRANT_URL
+          value: "http://qdrant:6333"
+        - name: QDRANT_COLLECTION
+          value: "kcu-knowledge"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-api
+  namespace: tenant-test-dept
+  labels:
+    app: rag-api
+spec:
+  selector:
+    app: rag-api
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+  type: ClusterIP

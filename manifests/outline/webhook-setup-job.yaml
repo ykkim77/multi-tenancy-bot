@@ -1,0 +1,73 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: outline-webhook-setup
+  namespace: tenant-test-dept
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: setup-webhook
+        image: postgres:15-alpine
+        env:
+        - name: PGPASSWORD
+          value: outline-pass
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Waiting for PostgreSQL to be ready..."
+            until psql -h outline-postgres -U outline -d outline -c '\q' 2>/dev/null; do
+              echo "PostgreSQL is unavailable - sleeping"
+              sleep 2
+            done
+            echo "PostgreSQL is ready!"
+            
+            echo "Waiting for Outline tables to be created..."
+            until psql -h outline-postgres -U outline -d outline -c "SELECT COUNT(*) FROM teams;" > /dev/null 2>&1; do
+              echo "Outline tables are not ready - sleeping"
+              sleep 2
+            done
+            echo "Outline tables are ready!"
+            
+            echo "Creating webhook subscription..."
+            TEAM_ID=$(psql -h outline-postgres -U outline -d outline -t -c "SELECT id FROM teams ORDER BY \"createdAt\" DESC LIMIT 1;" | xargs)
+            USER_ID=$(psql -h outline-postgres -U outline -d outline -t -c "SELECT id FROM users WHERE \"teamId\" = '$TEAM_ID' LIMIT 1;" | xargs)
+            
+            if [ -z "$TEAM_ID" ] || [ -z "$USER_ID" ]; then
+              echo "No team or user found. Please log in to Outline first to create them."
+              exit 0
+            fi
+            
+            echo "Team ID: $TEAM_ID"
+            echo "User ID: $USER_ID"
+            
+            psql -h outline-postgres -U outline -d outline <<'EOSQL'
+            INSERT INTO webhook_subscriptions (
+              id, "teamId", "createdById", url, enabled, name, events, "createdAt", "updatedAt", secret
+            ) 
+            SELECT 
+              gen_random_uuid(),
+              t.id,
+              u.id,
+              'http://embedding-worker:8000/webhook/outline',
+              true,
+              'Embedding Worker Integration',
+              ARRAY['documents.create', 'documents.update', 'documents.update.debounced', 'documents.update.delayed', 'documents.delete', 'documents.publish', 'documents.title_change']::text[],
+              NOW(),
+              NOW(),
+              NULL
+            FROM teams t
+            CROSS JOIN LATERAL (
+              SELECT id FROM users WHERE "teamId" = t.id LIMIT 1
+            ) u
+            WHERE t.id = (SELECT id FROM teams ORDER BY "createdAt" DESC LIMIT 1)
+            ON CONFLICT (url, "teamId") DO UPDATE SET 
+              enabled = true, 
+              events = EXCLUDED.events, 
+              "updatedAt" = NOW();
+            EOSQL
+            
+            echo "Webhook subscription created/updated successfully!"

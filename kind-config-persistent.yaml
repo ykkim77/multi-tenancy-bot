@@ -1,0 +1,22 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kcu-demo
+nodes:
+- role: control-plane
+  extraMounts:
+  - hostPath: /root/kcu-knowledge-portal/data/postgres
+    containerPath: /var/local-path-provisioner
+    readOnly: false
+    propagation: Bidirectional
+- role: worker
+  extraMounts:
+  - hostPath: /root/kcu-knowledge-portal/data/postgres
+    containerPath: /var/local-path-provisioner
+    readOnly: false
+    propagation: Bidirectional
+- role: worker
+  extraMounts:
+  - hostPath: /root/kcu-knowledge-portal/data/postgres
+    containerPath: /var/local-path-provisioner
+    readOnly: false
+    propagation: Bidirectional
