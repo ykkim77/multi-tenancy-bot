@@ -375,6 +375,36 @@ def cleanup(tenant_ids: List[str]) -> None:
              "--grace-period=0", "--force"], check=False, timeout=60)
 
 
+def _wait_for_cleanup(tenant_ids: List[str], timeout: float = 30) -> None:
+    """
+    Block until all ChatSpaces and tenant Namespaces from a previous run are
+    fully deleted (or until `timeout` seconds elapse).
+
+    This prevents the "object already exists" / "Terminating" races that occur
+    when a new run starts before the previous run's finalizer teardown is done.
+    ChatSpace finalizers cascade to namespace deletion, which can take 2-10 s.
+    """
+    deadline = time.perf_counter() + timeout
+    cs_names = [f"cs-{tid}" for tid in tenant_ids]
+    ns_names = [f"{NAMESPACE_PREFIX}{tid}" for tid in tenant_ids]
+
+    while time.perf_counter() < deadline:
+        remaining = []
+        for n in cs_names:
+            r = run(["kubectl", "get", "chatspace", n], check=False)
+            if r.returncode == 0:
+                remaining.append(f"cs/{n}")
+        for n in ns_names:
+            r = run(["kubectl", "get", "ns", n], check=False)
+            if r.returncode == 0:
+                remaining.append(f"ns/{n}")
+        if not remaining:
+            return
+        time.sleep(0.5)
+
+    log(f"    ⚠ cleanup timeout — some artefacts still exist (proceeding anyway)")
+
+
 # ── Run a single (mode, batch) configuration ─────────────────────────
 
 @dataclass
@@ -399,7 +429,9 @@ def execute_run(mode: Literal["manual", "helm", "agentic"],
     log(f"\n  ── {mode.upper()} | batch={batch_size} | run={run_idx + 1} ──")
 
     cleanup(tenant_ids)
-    time.sleep(0.3)
+    # Wait for previous-run artefacts to be fully removed before creating
+    # new ones with the same names (finalizer teardown can take a few seconds).
+    _wait_for_cleanup(tenant_ids, timeout=30)
 
     submit_fns = {"manual": submit_manual, "helm": submit_helm,
                   "agentic": submit_agentic}
@@ -409,13 +441,28 @@ def execute_run(mode: Literal["manual", "helm", "agentic"],
     t0 = time.perf_counter()
 
     if mode == "manual":
-        # Sequential — the user's spec for the manual baseline.
         for tid in tenant_ids:
             submit_fns[mode](tid)
     else:
-        # Helm/Agentic: parallel client-side submission of independent commands
+        # Parallel submission — surface per-CR errors immediately
+        errors_seen: List[str] = []
         with ThreadPoolExecutor(max_workers=min(16, batch_size)) as ex:
-            list(ex.map(submit_fns[mode], tenant_ids))
+            futures = {ex.submit(submit_fns[mode], tid): tid
+                       for tid in tenant_ids}
+            for fut in futures:
+                tid = futures[fut]
+                try:
+                    fut.result()
+                except Exception as exc:
+                    errors_seen.append(f"{tid}: {exc}")
+        if errors_seen:
+            log(f"    ⚠ Submission errors ({len(errors_seen)}/{batch_size}):")
+            for e in errors_seen:
+                log(f"      {e}")
+            if len(errors_seen) == batch_size:
+                log("    ✗ ALL submissions failed — aborting this run")
+                rec.ready_latency_s = float("nan")
+                return rec
 
     rec.apply_latency_s = time.perf_counter() - t0
     log(f"    [2/3] Submission done in {rec.apply_latency_s:.2f}s; polling for Ready ...")

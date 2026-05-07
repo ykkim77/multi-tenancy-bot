@@ -21,10 +21,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -100,7 +100,6 @@ func (r *ChatSpaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if added, err := r.reconcileFinalizer(ctx, cs); err != nil {
 		return ctrl.Result{}, err
 	} else if added {
-		// The Update above triggered a fresh event; let it requeue naturally.
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -108,8 +107,6 @@ func (r *ChatSpaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if cs.Spec.Tier == "" {
 		cs.Spec.Tier = portalv1.TierStandard
 	}
-	// Note: Agentic.Enabled defaults to true via kubebuilder annotation,
-	// but webhook defaults aren't running, so be defensive in code too.
 	if cs.Spec.Agentic.ReclaimIdleAfterSeconds == 0 {
 		cs.Spec.Agentic.ReclaimIdleAfterSeconds = 120
 	}
@@ -117,77 +114,83 @@ func (r *ChatSpaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		cs.Spec.Agentic.ActiveBoostFactor = "1.5"
 	}
 
-	// ── Phase: Provisioning ───────────────────────────────────────
-	if cs.Status.Phase == "" || cs.Status.Phase == portalv1.PhasePending {
-		_ = r.setPhase(ctx, cs, portalv1.PhaseProvisioning, "starting provisioning")
-	}
-
 	// ── Cluster-scoped resources ──────────────────────────────────
 	if err := r.ensureClusterPriorityClasses(ctx); err != nil {
 		logger.Error(err, "ensure priorityclasses")
-		_ = r.setPhase(ctx, cs, portalv1.PhaseFailed, fmt.Sprintf("priorityclasses: %v", err))
 		return ctrl.Result{}, err
 	}
 
 	// ── Agentic decision ──────────────────────────────────────────
 	effective, explanation, err := r.computeEffectiveQuota(ctx, cs)
 	if err != nil {
-		logger.Error(err, "agentic decision")
-		// Continue with the static quota; the explanation already reflects this.
+		logger.Error(err, "agentic decision — using static quota")
 	}
 
-	// ── Provision: Namespace ──────────────────────────────────────
+	// ── Provision resources (all idempotent) ──────────────────────
 	ns, err := r.reconcileNamespace(ctx, cs)
 	if err != nil {
-		_ = r.setPhase(ctx, cs, portalv1.PhaseFailed, err.Error())
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("namespace: %w", err)
 	}
-
-	// ── Provision: ResourceQuota / LimitRange / NetworkPolicy ─────
 	if err := r.reconcileResourceQuota(ctx, cs, ns.Name, effective); err != nil {
-		_ = r.setPhase(ctx, cs, portalv1.PhaseFailed, err.Error())
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("resourcequota: %w", err)
 	}
 	if err := r.reconcileLimitRange(ctx, cs, ns.Name, effective); err != nil {
-		_ = r.setPhase(ctx, cs, portalv1.PhaseFailed, err.Error())
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("limitrange: %w", err)
 	}
 	if err := r.reconcileNetworkPolicy(ctx, cs, ns.Name); err != nil {
-		_ = r.setPhase(ctx, cs, portalv1.PhaseFailed, err.Error())
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("networkpolicy: %w", err)
 	}
 
-	// ── Status update ─────────────────────────────────────────────
-	cs.Status.AgenticActions = appendAction(cs.Status.AgenticActions, "agentic: "+explanation)
-	cs.Status.Namespace = ns.Name
-	cs.Status.AppliedQuota = effective
-	cs.Status.Phase = portalv1.PhaseReady
-	cs.Status.Message = "tenant ready"
-	cs.Status.LastUpdated = metav1.Now()
-	cs.Status.ObservedGeneration = cs.Generation
-	r.setReadyCondition(cs, true, "Provisioned", "All resources reconciled successfully")
-
-	if err := r.Status().Update(ctx, cs); err != nil {
-		logger.Error(err, "update status")
-		return ctrl.Result{}, err
+	// ── Status update — single write with RetryOnConflict ─────────
+	// Pattern: re-fetch a fresh copy inside the retry loop so we always
+	// write against the latest resourceVersion.  This eliminates the
+	// "object has been modified" conflict that occurs when:
+	//   (a) multiple workers process the same CR simultaneously, or
+	//   (b) an intermediate Status().Update() during provisioning
+	//       made the in-memory cs stale before the final write.
+	nsName := ns.Name
+	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &portalv1.ChatSpace{}
+		if ferr := r.Get(ctx, req.NamespacedName, fresh); ferr != nil {
+			return ferr
+		}
+		fresh.Status.AgenticActions = appendAction(
+			fresh.Status.AgenticActions, "agentic: "+explanation)
+		fresh.Status.Namespace = nsName
+		fresh.Status.AppliedQuota = effective
+		fresh.Status.Phase = portalv1.PhaseReady
+		fresh.Status.Message = "tenant ready"
+		fresh.Status.LastUpdated = metav1.Now()
+		fresh.Status.ObservedGeneration = fresh.Generation
+		r.setReadyCondition(fresh, true, "Provisioned", "All resources reconciled successfully")
+		return r.Status().Update(ctx, fresh)
+	})
+	if updateErr != nil {
+		logger.Error(updateErr, "update status")
+		return ctrl.Result{}, updateErr
 	}
 
-	logger.Info("reconciled", "phase", cs.Status.Phase,
-		"tier", cs.Spec.Tier, "namespace", ns.Name)
+	logger.Info("reconciled", "phase", portalv1.PhaseReady,
+		"tier", cs.Spec.Tier, "namespace", nsName)
 
-	// Re-evaluate periodically so agentic re-balancing keeps converging.
 	return ctrl.Result{RequeueAfter: r.rebalanceInterval()}, nil
 }
 
-// setPhase is a small helper that updates Status.Phase + Message.
-// It is best-effort; failures are logged but do not stop reconciliation.
+// setPhase is kept for external callers (e.g. finalize).
+// It uses RetryOnConflict so it never returns a stale-resource-version error.
 func (r *ChatSpaceReconciler) setPhase(
 	ctx context.Context, cs *portalv1.ChatSpace, phase portalv1.ChatSpacePhase, msg string,
 ) error {
-	cs.Status.Phase = phase
-	cs.Status.Message = msg
-	cs.Status.LastUpdated = metav1.Now()
-	return r.Status().Update(ctx, cs)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &portalv1.ChatSpace{}
+		if ferr := r.Get(ctx, client.ObjectKeyFromObject(cs), fresh); ferr != nil {
+			return ferr
+		}
+		fresh.Status.Phase = phase
+		fresh.Status.Message = msg
+		fresh.Status.LastUpdated = metav1.Now()
+		return r.Status().Update(ctx, fresh)
+	})
 }
 
 // setReadyCondition writes a Ready condition using the standard Kubernetes pattern.
@@ -220,18 +223,26 @@ func (r *ChatSpaceReconciler) setReadyCondition(cs *portalv1.ChatSpace, ready bo
 // SetupWithManager wires the controller into the manager and configures
 // watches on owned resources so the Operator reacts to drift.
 //
-// MaxConcurrentReconciles allows the controller to process multiple ChatSpace
-// CRs in parallel. Without this, a batch of N CRs queues up and is processed
-// sequentially by a single worker, negating the Operator's DAG-parallel
-// provisioning advantage over manual kubectl apply loops.
-// Setting it to 20 means up to 20 tenants can be provisioned simultaneously.
+// MaxConcurrentReconciles=20 allows parallel provisioning of up to 20
+// ChatSpace CRs simultaneously.
+//
+// ── Why PriorityClass watch is intentionally OMITTED ──────────────────
+// PriorityClasses are cluster-scoped and shared.  If we watch them, every
+// CreateOrUpdate inside ensureClusterPriorityClasses fires a watch event
+// that enqueues ALL ChatSpaces.  With 20 concurrent workers and e.g. 10
+// experiment CRs, this creates a thundering-herd: 200 simultaneous
+// reconciles competing for the same objects → cascading conflict errors.
+// PriorityClasses are owned by the Operator itself and won't drift from
+// external sources in normal operation, so the watch provides no benefit
+// while causing significant harm to parallel provisioning throughput.
 func (r *ChatSpaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&portalv1.ChatSpace{}).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 20,
 		}).
-		// Watch owned resources so external edits trigger re-reconciliation.
+		// Watch namespace-scoped owned resources so external edits trigger re-reconciliation.
+		// PriorityClass watch is intentionally omitted — see comment above.
 		Watches(&corev1.Namespace{},
 			handler.EnqueueRequestsFromMapFunc(r.namespaceToChatSpace)).
 		Watches(&corev1.ResourceQuota{},
@@ -240,8 +251,6 @@ func (r *ChatSpaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
 		Watches(&networkingv1.NetworkPolicy{},
 			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
-		Watches(&schedulingv1.PriorityClass{},
-			handler.EnqueueRequestsFromMapFunc(r.priorityClassToChatSpaces)).
 		Complete(r)
 }
 
@@ -264,8 +273,9 @@ func (r *ChatSpaceReconciler) objectToChatSpaceFromLabels(ctx context.Context, o
 	return r.namespaceToChatSpace(ctx, obj)
 }
 
-// priorityClassToChatSpaces enqueues every ChatSpace when a managed PriorityClass changes.
-// PriorityClasses are cluster-scoped and shared, so any drift requires a global sweep.
+// priorityClassToChatSpaces is no longer wired into SetupWithManager.
+// Kept as dead code to document the reasoning; the watch was removed to
+// prevent the thundering-herd described in SetupWithManager's comment.
 func (r *ChatSpaceReconciler) priorityClassToChatSpaces(ctx context.Context, obj client.Object) []reconcile.Request {
 	labels := obj.GetLabels()
 	if labels == nil || labels["app.kubernetes.io/managed-by"] != "kcu-portal-operator" {
