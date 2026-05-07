@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -218,9 +219,18 @@ func (r *ChatSpaceReconciler) setReadyCondition(cs *portalv1.ChatSpace, ready bo
 
 // SetupWithManager wires the controller into the manager and configures
 // watches on owned resources so the Operator reacts to drift.
+//
+// MaxConcurrentReconciles allows the controller to process multiple ChatSpace
+// CRs in parallel. Without this, a batch of N CRs queues up and is processed
+// sequentially by a single worker, negating the Operator's DAG-parallel
+// provisioning advantage over manual kubectl apply loops.
+// Setting it to 20 means up to 20 tenants can be provisioned simultaneously.
 func (r *ChatSpaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&portalv1.ChatSpace{}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: 20,
+		}).
 		// Watch owned resources so external edits trigger re-reconciliation.
 		Watches(&corev1.Namespace{},
 			handler.EnqueueRequestsFromMapFunc(r.namespaceToChatSpace)).

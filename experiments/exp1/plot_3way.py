@@ -129,13 +129,20 @@ def plot(data: List[dict], out_path: Path) -> None:
     ax2.grid(True, alpha=0.3, axis="y")
 
     # ─── (c) Server-side timing for Agentic ─────────────────────────
+    # Uses "duration" = e2e_duration (client submit → conditions[Ready])
+    # which has µs precision and is never 0, even for sub-second reconciles.
     ax3 = fig.add_subplot(gs[0, 2])
     server_records = [r for r in data if r.get("server_side")]
     if server_records:
         per_tenant_durs: Dict[int, List[float]] = {}
+        n_e2e_total = 0
         for r in server_records:
             for t in r["server_side"]["per_tenant"]:
-                per_tenant_durs.setdefault(r["batch_size"], []).append(t["server_duration"])
+                # "duration" = e2e_duration if available, server_duration otherwise
+                d = t.get("duration") or t.get("e2e_duration") or t.get("server_duration", 0.0)
+                per_tenant_durs.setdefault(r["batch_size"], []).append(d)
+                if "e2e_duration" in t:
+                    n_e2e_total += 1
         positions, vals_list, lbls = [], [], []
         for i, batch in enumerate(sorted(per_tenant_durs.keys()), start=1):
             positions.append(i); vals_list.append(per_tenant_durs[batch])
@@ -153,13 +160,18 @@ def plot(data: List[dict], out_path: Path) -> None:
                         color=MODE_COLOR["agentic"],
                         edgecolor="black", s=20, alpha=0.7, zorder=3)
         ax3.set_xticks(positions); ax3.set_xticklabels(lbls, fontsize=9)
+        if n_e2e_total > 0:
+            ax3.text(0.02, 0.98, f"E2E timing (µs precision)\nn={n_e2e_total}",
+                     transform=ax3.transAxes, fontsize=8.5, va="top", ha="left",
+                     bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF8E7",
+                               edgecolor="#aaa", alpha=0.9))
     else:
         ax3.text(0.5, 0.5, "No Agentic data\n(server-side timings)",
                  ha="center", va="center", fontsize=11, color="gray",
                  transform=ax3.transAxes)
-    ax3.set_ylabel("Operator response time (s)\n(creationTimestamp → Ready)",
+    ax3.set_ylabel("Operator response time (s)\n(client submit → conditions[Ready])",
                    fontsize=10)
-    ax3.set_title("(c) Agentic — server-side timing",
+    ax3.set_title("(c) Agentic — E2E server-side timing",
                   fontsize=12, fontweight="bold", loc="left")
     ax3.grid(True, alpha=0.3, axis="y")
 

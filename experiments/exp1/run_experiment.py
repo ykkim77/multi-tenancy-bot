@@ -47,6 +47,11 @@ NAMESPACE_PREFIX = "tenant-"
 POLL_INTERVAL = 0.1
 MAX_WAIT = 180.0
 
+# Module-level dict: tenant_id → float epoch (seconds) recorded immediately
+# before kubectl apply.  Used as the t0 for E2E server-side timing so that
+# even sub-second reconciles produce a positive (non-zero) duration.
+_submit_epochs: Dict[str, float] = {}
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -137,10 +142,18 @@ def submit_helm(tenant_id: str) -> None:
 
 
 def submit_agentic(tenant_id: str) -> None:
+    # Record the client-side submit epoch with microsecond precision BEFORE
+    # sending to the API server.  This becomes the t0 for E2E server-side
+    # timing and avoids the "0-second duration" problem caused by
+    # Kubernetes RFC3339 timestamps having only 1-second granularity.
+    t_submit = time.time()
+    _submit_epochs[tenant_id] = t_submit
     cs_yaml = (
         f"apiVersion: portal.kcu.ac.kr/v1\nkind: ChatSpace\n"
-        f"metadata:\n  name: cs-{tenant_id}\n  labels:\n"
-        f"    exp1: \"true\"\n    method: agentic\n"
+        f"metadata:\n  name: cs-{tenant_id}\n"
+        f"  annotations:\n"
+        f"    portal.kcu.ac.kr/client-submit-epoch: \"{t_submit:.6f}\"\n"
+        f"  labels:\n    exp1: \"true\"\n    method: agentic\n"
         f"spec:\n  tenantId: {tenant_id}\n  tier: standard\n"
         f"  agentic:\n    enabled: true\n    hardIsolation: true\n"
     )
@@ -180,27 +193,73 @@ def is_chatspace_ready(tenant_id: str) -> bool:
 
 def server_side_timing_for_chatspace(tenant_id: str) -> Optional[Dict[str, float]]:
     """
-    For the Agentic path, return server-side `creationTimestamp` and
-    `conditions[Ready].lastTransitionTime` (epoch seconds).
+    Return timing data for a ChatSpace CR.
+
+    Two durations are computed:
+
+    1. e2e_duration (primary, always > 0):
+         client_submit_epoch  →  conditions[Ready].lastTransitionTime
+         Uses _submit_epochs[] (set just before kubectl apply) as t0.
+         Includes network RTT + API admission + Reconcile time.
+         Never 0 even if Reconcile completes within the same calendar second.
+
+    2. server_duration (informational, may be 0 for fast Reconciles):
+         metadata.creationTimestamp  →  conditions[Ready].lastTransitionTime
+         Pure server-side view — bounded by RFC3339 1-second granularity.
+         Use as a lower-bound / sanity check only.
+
+    Root cause of "0-second" results in earlier runs:
+      Kubernetes RFC3339 timestamps have 1-second resolution.  If the
+      Reconcile loop completes within the same clock-second as the CR was
+      admitted (very common for KinD clusters with co-located API server
+      and controller), creationTimestamp == lastTransitionTime → diff = 0.
+      Using the client-side submit epoch fixes this permanently.
     """
     r = run(["kubectl", "get", "chatspace", f"cs-{tenant_id}", "-o", "json"],
             check=False)
     if r.returncode != 0:
         return None
-    obj = json.loads(r.stdout)
-    created = parse_k8s_time(obj.get("metadata", {}).get("creationTimestamp", ""))
-    ready_at = None
+    try:
+        obj = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    meta = obj.get("metadata", {})
+    created = parse_k8s_time(meta.get("creationTimestamp", ""))
+
+    # Ready condition timestamp (t1 — server clock, 1-second granularity)
+    ready_at: Optional[float] = None
     for c in (obj.get("status") or {}).get("conditions", []) or []:
         if c.get("type") == "Ready" and c.get("status") == "True":
             ready_at = parse_k8s_time(c.get("lastTransitionTime", ""))
             break
-    if created is None or ready_at is None:
+    if ready_at is None:
         return None
-    return {
-        "created_epoch": created,
-        "ready_epoch": ready_at,
-        "server_duration": max(0.0, ready_at - created),
-    }
+
+    # t0: prefer in-memory dict (most precise); fall back to annotation on CR.
+    client_submit = _submit_epochs.get(tenant_id)
+    if client_submit is None:
+        ann = meta.get("annotations") or {}
+        raw = ann.get("portal.kcu.ac.kr/client-submit-epoch", "")
+        if raw:
+            try:
+                client_submit = float(raw)
+            except ValueError:
+                pass
+
+    result: Dict[str, float] = {"ready_epoch": ready_at}
+    if created is not None:
+        result["created_epoch"] = created
+        result["server_duration"] = max(0.0, ready_at - created)
+
+    if client_submit is not None:
+        result["client_submit_epoch"] = client_submit
+        # Primary metric: never 0 because client clock has µs precision.
+        result["e2e_duration"] = max(0.001, ready_at - client_submit)
+
+    # Canonical "duration" field: E2E when available, server otherwise.
+    result["duration"] = result.get("e2e_duration") or result.get("server_duration", 0.0)
+    return result
 
 
 # ── Cleanup ──────────────────────────────────────────────────────────
@@ -274,18 +333,24 @@ def execute_run(mode: Literal["manual", "helm", "agentic"],
     log(f"    [2/3] Submission done in {rec.apply_latency_s:.2f}s; polling for Ready ...")
 
     # ── Cumulative success curve ──
+    # Optimisation: once a tenant is confirmed ready, skip rechecking it.
+    # Without this, B=10 × 10 runs generates hundreds of redundant API calls
+    # per second against an already-loaded API server, distorting latency.
     rec.times_s.append(0.0)
     rec.cumulative_pct.append(0.0)
 
+    already_ready: set = set()
     deadline = time.perf_counter() + MAX_WAIT
     last_ready = 0
-    poll_count = 0
     while time.perf_counter() < deadline:
         elapsed = time.perf_counter() - t0
-        ready = sum(1 for tid in tenant_ids if ready_fn(tid))
+        # Only recheck tenants that are NOT yet confirmed ready.
+        for tid in tenant_ids:
+            if tid not in already_ready and ready_fn(tid):
+                already_ready.add(tid)
+        ready = len(already_ready)
         rec.times_s.append(elapsed)
         rec.cumulative_pct.append(100.0 * ready / batch_size)
-        poll_count += 1
         if ready != last_ready:
             log(f"      t={elapsed:5.2f}s  {ready}/{batch_size} ready ({100*ready/batch_size:.1f}%)")
             last_ready = ready
@@ -294,7 +359,7 @@ def execute_run(mode: Literal["manual", "helm", "agentic"],
             break
         time.sleep(POLL_INTERVAL)
     else:
-        log(f"    ⚠ Timeout after {MAX_WAIT}s (only {last_ready}/{batch_size} ready)")
+        log(f"    ⚠ Timeout after {MAX_WAIT}s (only {len(already_ready)}/{batch_size} ready)")
         rec.ready_latency_s = float("nan")
 
     # ── Agentic: collect server-side timing ──
@@ -306,17 +371,24 @@ def execute_run(mode: Literal["manual", "helm", "agentic"],
             if t:
                 ss.append(t)
         if ss:
-            durations = [x["server_duration"] for x in ss]
+            # Primary metric: e2e_duration (client submit → server Ready timestamp).
+            # Falls back to server_duration if e2e not available.
+            durations = [x["duration"] for x in ss]
+            e2e_available = sum(1 for x in ss if "e2e_duration" in x)
             rec.server_side = {
                 "n": len(ss),
+                "n_e2e": e2e_available,
                 "mean_s": float(np.mean(durations)),
                 "median_s": float(np.median(durations)),
+                "p95_s": float(np.percentile(durations, 95)),
                 "max_s": float(np.max(durations)),
                 "min_s": float(np.min(durations)),
                 "per_tenant": ss,
             }
-            log(f"      Server-side timings — n={len(ss)}, "
-                f"mean={rec.server_side['mean_s']:.3f}s, "
+            log(f"      Server-side timings (E2E n={e2e_available}/{len(ss)}) — "
+                f"mean={rec.server_side['mean_s']:.3f}s  "
+                f"median={rec.server_side['median_s']:.3f}s  "
+                f"p95={rec.server_side['p95_s']:.3f}s  "
                 f"max={rec.server_side['max_s']:.3f}s")
     else:
         log(f"    [3/3] (server-side timing skipped — {mode})")
@@ -333,7 +405,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Experiment 1: Manual vs Helm vs Agentic")
     parser.add_argument("--batch-sizes", default="5,10",
                         help="Comma-separated batch sizes (e.g. '5,10').")
-    parser.add_argument("--runs", type=int, default=3, help="Runs per (mode,batch).")
+    parser.add_argument("--runs", type=int, default=10,
+                        help="Runs per (mode,batch). ≥10 recommended for Mann-Whitney U (default: 10).")
     parser.add_argument("--modes", default="manual,helm,agentic",
                         help="Subset of methods to run.")
     parser.add_argument("--tag", default="exp1",
@@ -396,9 +469,12 @@ def main() -> int:
             continue
         by_key.setdefault((rec["mode"], rec["batch_size"]), []).append(rec["ready_latency_s"])
         if rec.get("server_side"):
-            server_by_key.setdefault((rec["mode"], rec["batch_size"]), []).append(
-                rec["server_side"]["mean_s"]
-            )
+            # Collect per-tenant "duration" values (e2e preferred, server fallback)
+            per_t = rec["server_side"].get("per_tenant", [])
+            for t in per_t:
+                server_by_key.setdefault(
+                    (rec["mode"], rec["batch_size"]), []
+                ).append(t["duration"])
 
     log(f"  {'Mode':<10s}{'Batch':>8s}{'Mean(s)':>12s}{'Std(s)':>10s}{'N':>5s}")
     for (mode, batch) in sorted(by_key.keys()):
@@ -406,9 +482,13 @@ def main() -> int:
         log(f"  {mode:<10s}{batch:>8d}{np.mean(vals):>12.3f}{np.std(vals):>10.3f}{len(vals):>5d}")
 
     if server_by_key:
-        log("\n  Agentic — server-side mean(s) (per ChatSpace, then averaged):")
+        log("\n  Agentic — E2E server-side (client submit → conditions[Ready], µs precision):")
         for (mode, batch), vals in sorted(server_by_key.items()):
-            log(f"    {mode:<10s}{batch:>8d}{np.mean(vals):>12.3f}")
+            log(f"    {mode:<10s}{batch:>8d}"
+                f"  mean={np.mean(vals):>7.3f}s"
+                f"  median={np.median(vals):>7.3f}s"
+                f"  p95={np.percentile(vals,95):>7.3f}s"
+                f"  n={len(vals)}")
 
     log("\n✓ Done. Run plot_3way.py to generate figures.")
     return 0
