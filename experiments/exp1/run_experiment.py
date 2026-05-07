@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-실험 1: Manual vs Helm vs Agentic 프로비저닝 비교
+실험 1: Helm vs Agentic 프로비저닝 속도 비교
+═══════════════════════════════════════════════════════════════════════════════
 
-세 가지 방식으로 동일한 테넌트 묶음(Namespace + ResourceQuota + LimitRange
-+ NetworkPolicy)을 프로비저닝한 뒤, **서버 측 시각**을 기준으로
-"Ready"까지의 시간을 측정한다.
+비교 대상
+─────────
+  Helm    : helm install 한 번 실행 → 차트 내부에서 4종 리소스 일괄 생성
+            (Namespace + ResourceQuota + LimitRange + NetworkPolicy)
+  Agentic : ChatSpace CR 하나만 제출 → Operator가 동일한 4종 리소스를
+            MaxConcurrentReconciles=20 으로 병렬 생성 + status 업데이트
 
-  1. Manual  : kubectl apply 를 리소스별로 순차 실행 (이론적 한계 속도의 baseline)
-  2. Helm    : `helm install kcu-tenant` 한 번 실행 → 차트 내부에서 일괄 적용
-  3. Agentic : ChatSpace CR 한 개를 apply → 실제 Operator가 모든 리소스 생성
+설계 근거: 공정 비교(Fair-Comparison) 원칙
+─────────────────────────────────────────
+  과거 실험은 Agentic이 Helm보다 많은 리소스를 생성(+PriorityClass +RBAC
+  +agenticActions)해서 구조적으로 느릴 수밖에 없었다.
+  두 경로가 **동일한 4종 테넌트 리소스**를 프로비저닝하도록 통일한다:
 
-측정 방법론:
-  - 모든 모드: 클라이언트 측 t0 = 명령 제출 직전 (perf_counter)
-  - Agentic: 추가로 **서버 측 timing** 도 별도 기록
-              (metadata.creationTimestamp → status.conditions[Ready].lastTransitionTime)
-  - "Ready" 판정: 모드 무관하게 NS/Quota/LimitRange/NetPol 4개 리소스 모두 존재
-                  (Agentic 추가로: status.phase == Ready)
+    Helm    : Chart 내 NS + RQ + LR + NetPol  (기존 chart 에 이미 포함됨)
+    Agentic : Operator 가 NS + RQ + LR + NetPol 생성
+              (+ status/agenticActions 는 Operator overhead 로 측정에 반영됨)
 
-이전 버전(`Python 모방 Operator + time.time()`)을 대체합니다.
+  PriorityClass 는 클러스터-스코프 공유 리소스이므로 실험 setup 단계에서
+  한 번만 생성하고, 두 경로 모두 pre-existing 상태에서 참조만 한다.
+
+측정 방법론
+───────────
+  t0      : 명령 제출 직전 time.time() (µs 정밀도)
+  Helm    : t0 → NS/RQ/LR/NetPol 4종 모두 존재 (kubectl get 폴링)
+  Agentic : t0 → status.phase == Ready (+ 내부적으로 4종 확인)
+            서버 측 E2E: client-submit-epoch 어노테이션 → conditions[Ready].lastTransitionTime
+            (Kubernetes RFC3339 1초 해상도 문제를 우회하기 위해 µs epoch 을 annotation 에 삽입)
+
+이전 버전(`Python 모방 Operator + time.time()`, Manual 포함)을 대체합니다.
 """
 from __future__ import annotations
 
@@ -47,6 +61,20 @@ NAMESPACE_PREFIX = "tenant-"
 POLL_INTERVAL = 0.1
 MAX_WAIT = 180.0
 
+# The same 3 PriorityClasses as ensureClusterPriorityClasses() in the Operator.
+# They are cluster-scoped and shared; created once during experiment setup.
+PRIORITY_CLASSES = [
+    {"name": "kcu-tenant-priority",  "value": 10000,
+     "preemptionPolicy": "PreemptLowerPriority",
+     "description": "High-priority tenants protected from noisy neighbors"},
+    {"name": "kcu-tenant-standard",  "value": 1000,
+     "preemptionPolicy": "Never",
+     "description": "Default-priority tenants"},
+    {"name": "kcu-tenant-internal",  "value": 100,
+     "preemptionPolicy": "Never",
+     "description": "Best-effort/internal-only tenants, first to be reclaimed"},
+]
+
 # Module-level dict: tenant_id → float epoch (seconds) recorded immediately
 # before kubectl apply.  Used as the t0 for E2E server-side timing so that
 # even sub-second reconciles produce a positive (non-zero) duration.
@@ -55,6 +83,43 @@ _submit_epochs: Dict[str, float] = {}
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+# ── Cluster setup (run once before any experiment) ────────────────────
+
+def setup_cluster_priority_classes() -> None:
+    """
+    Idempotently create the three shared PriorityClasses that both Helm and
+    the Agentic Operator reference.  Mirrors the Operator's
+    ensureClusterPriorityClasses() so that neither path has to create them
+    during the timed provisioning window.
+
+    This must be called before any experiment run; it is harmless to call
+    multiple times (uses kubectl apply --server-side for idempotency).
+    """
+    log("  [setup] Ensuring cluster PriorityClasses ...")
+    for pc in PRIORITY_CLASSES:
+        yaml = (
+            f"apiVersion: scheduling.k8s.io/v1\n"
+            f"kind: PriorityClass\n"
+            f"metadata:\n"
+            f"  name: {pc['name']}\n"
+            f"  labels:\n"
+            f"    app.kubernetes.io/managed-by: kcu-experiment\n"
+            f"    experiment: exp1\n"
+            f"value: {pc['value']}\n"
+            f"globalDefault: false\n"
+            f"preemptionPolicy: {pc['preemptionPolicy']}\n"
+            f"description: {pc['description']!r}\n"
+        )
+        r = run(["kubectl", "apply", "--server-side",
+                 "--field-manager=kcu-exp1", "-f", "-"],
+                stdin=yaml, check=False, timeout=30)
+        if r.returncode != 0:
+            # Fallback: non-server-side apply (older kubectl)
+            run(["kubectl", "apply", "-f", "-"], stdin=yaml,
+                check=True, timeout=30)
+        log(f"    ✓ PriorityClass {pc['name']} ({pc['value']})")
 
 
 # ── kubectl helpers ──────────────────────────────────────────────────
@@ -130,13 +195,23 @@ def submit_manual(tenant_id: str) -> None:
         run(["kubectl", "apply", "-f", "-"], stdin=y, check=True)
 
 
-def submit_helm(tenant_id: str) -> None:
+def submit_helm(tenant_id: str, tier: str = "standard") -> None:
+    """
+    Install the kcu-tenant Helm chart for one tenant.
+
+    The chart provisions the SAME 4 resources as the Agentic Operator:
+      Namespace + ResourceQuota + LimitRange + NetworkPolicy
+
+    PriorityClass (`kcu-tenant-{tier}`) is pre-created by setup_cluster_priority_classes()
+    and referenced via a Namespace annotation; the chart does NOT create it
+    (priorityClass.create: false) to avoid parallel-install name conflicts.
+    """
     release = f"helm-{tenant_id}"
-    # `helm install --create-namespace` 는 차트 자체 Namespace 템플릿과 충돌하므로 비활성화
     run([
         "helm", "install", release, str(HELM_CHART),
         "--set", f"tenantId={tenant_id}",
-        "--set", "tier=standard",
+        "--set", f"tier={tier}",
+        "--set", "priorityClass.create=false",
         "--wait=false",
     ], check=True, timeout=60)
 
@@ -161,13 +236,26 @@ def submit_agentic(tenant_id: str) -> None:
 
 
 def is_ns_ready(tenant_id: str) -> bool:
-    """Common readiness check: 4 required objects exist."""
+    """
+    Shared readiness check used by both Helm and Agentic modes.
+
+    Verifies that all 4 tenant-scoped resources provisioned by BOTH paths
+    exist and are queryable:
+      1. Namespace        tenant-{id}
+      2. ResourceQuota    tenant-quota
+      3. LimitRange       tenant-limits
+      4. NetworkPolicy    tenant-isolation
+
+    Resource names are identical in:
+      - helm/templates/{resourcequota,limitrange,networkpolicy}.yaml
+      - operator/controllers/provisioner.go reconcileResourceQuota/LimitRange/NetworkPolicy
+    """
     ns = f"{NAMESPACE_PREFIX}{tenant_id}"
     if run(["kubectl", "get", "ns", ns], check=False).returncode != 0:
         return False
     for kind, name in [
-        ("resourcequota", "tenant-quota"),
-        ("limitrange", "tenant-limits"),
+        ("resourcequota",                "tenant-quota"),
+        ("limitrange",                   "tenant-limits"),
         ("networkpolicy.networking.k8s.io", "tenant-isolation"),
     ]:
         r = run(["kubectl", "get", kind, name, "-n", ns], check=False)
@@ -402,13 +490,26 @@ def execute_run(mode: Literal["manual", "helm", "agentic"],
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Experiment 1: Manual vs Helm vs Agentic")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Experiment 1: Helm vs Agentic Provisioning Speed Comparison.\n"
+            "Both modes provision identical resources: Namespace + ResourceQuota "
+            "+ LimitRange + NetworkPolicy.  PriorityClasses are pre-created "
+            "once by the setup step and shared by both paths."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--batch-sizes", default="5,10",
                         help="Comma-separated batch sizes (e.g. '5,10').")
     parser.add_argument("--runs", type=int, default=10,
                         help="Runs per (mode,batch). ≥10 recommended for Mann-Whitney U (default: 10).")
-    parser.add_argument("--modes", default="manual,helm,agentic",
-                        help="Subset of methods to run.")
+    parser.add_argument("--modes", default="helm,agentic",
+                        help=(
+                            "Subset of methods to run. "
+                            "Choices: helm,agentic[,manual]. "
+                            "Default: helm,agentic (fair comparison — both use "
+                            "identical 4-resource provisioning)."
+                        ))
     parser.add_argument("--tag", default="exp1",
                         help="Prefix for the synthetic tenant IDs (avoid collisions).")
     parser.add_argument("--skip-apply", action="store_true",
@@ -434,12 +535,17 @@ def main() -> int:
             modes = [m for m in modes if m != "helm"]
 
         log("=" * 70)
-        log("EXPERIMENT 1: Manual vs Helm vs Agentic Provisioning")
+        log("EXPERIMENT 1: Helm vs Agentic Provisioning Speed Comparison")
+        log("  Fair-comparison: both paths provision NS+RQ+LR+NetPol (4 resources)")
+        log("  PriorityClasses: pre-created once (shared cluster resource)")
         log("=" * 70)
         log(f"  Modes        : {modes}")
         log(f"  Batch sizes  : {batch_sizes}")
         log(f"  Runs         : {args.runs}")
         log(f"  Tag          : {args.tag}")
+
+        # ── Pre-setup: cluster PriorityClasses (idempotent) ──
+        setup_cluster_priority_classes()
 
         records: List[RunRecord] = []
         total = len(modes) * len(batch_sizes) * args.runs
@@ -490,7 +596,7 @@ def main() -> int:
                 f"  p95={np.percentile(vals,95):>7.3f}s"
                 f"  n={len(vals)}")
 
-    log("\n✓ Done. Run plot_3way.py to generate figures.")
+    log("\n✓ Done. Run plot_results.py (or plot_3way.py) to generate figures.")
     return 0
 
 

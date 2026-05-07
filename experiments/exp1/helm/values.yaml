@@ -1,6 +1,18 @@
 # Default values for the kcu-tenant chart.
-# Mirrored from the Agentic Operator's `standard` tier so Helm and
-# Operator paths produce equivalent end-states.
+#
+# ── Resource parity with the Agentic Operator ──────────────────────────────
+# This chart provisions the SAME tenant-scoped resources as the Operator:
+#   1. Namespace
+#   2. ResourceQuota
+#   3. LimitRange
+#   4. NetworkPolicy (hard cross-tenant isolation)
+#
+# PriorityClasses are cluster-scoped and SHARED across all tenants.
+# They are managed outside this chart (by the Operator's
+# ensureClusterPriorityClasses(), or by the experiment's setup step) and
+# referenced here by name only.  Set priorityClass.create: true ONLY when
+# installing a single "cluster-setup" release — never during parallel
+# per-tenant installs, as concurrent creates of the same name will conflict.
 
 tenantId: ""           # Required; e.g. "cs-dept"
 tier: "standard"       # priority | standard | internal — informational
@@ -19,4 +31,22 @@ limitRange:
   memoryRequest: "64Mi"
 
 networkPolicy:
-  enabled: true       # Hard cross-tenant isolation
+  enabled: true         # Hard cross-tenant isolation (matches Operator hardIsolation)
+
+priorityClass:
+  # Tenant's own PriorityClass name (pre-created by cluster setup, not this chart)
+  name: "kcu-tenant-standard"   # overridden by tier: priority → kcu-tenant-priority
+  create: false         # Set true ONLY for a single cluster-setup install
+  classes:
+    - name: kcu-tenant-priority
+      value: 10000
+      preemptionPolicy: PreemptLowerPriority
+      description: "High-priority tenants protected from noisy neighbors"
+    - name: kcu-tenant-standard
+      value: 1000
+      preemptionPolicy: Never
+      description: "Default-priority tenants"
+    - name: kcu-tenant-internal
+      value: 100
+      preemptionPolicy: Never
+      description: "Best-effort/internal-only tenants, first to be reclaimed"

@@ -5,3 +5,5 @@ metadata:
   labels:
     name: {{ include "kcu-tenant.namespace" . }}
     {{- include "kcu-tenant.labels" . | nindent 4 }}
+  annotations:
+    portal.kcu.ac.kr/priority-class: {{ include "kcu-tenant.priorityClassName" . | quote }}

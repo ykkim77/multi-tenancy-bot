@@ -1,0 +1,37 @@
+{{/*
+  PriorityClass setup template.
+
+  USAGE
+  ─────
+  This template is DISABLED by default (priorityClass.create: false).
+
+  In normal per-tenant installs, PriorityClasses are pre-created by the
+  cluster setup step (scripts/init-setup.sh or the Agentic Operator's
+  ensureClusterPriorityClasses()).  Enabling creation here during parallel
+  helm installs will cause race conditions on the same cluster-scoped name.
+
+  To create PriorityClasses once:
+    helm install kcu-cluster-setup ./helm --set priorityClass.create=true \
+         --set tenantId=_setup
+
+  The `helm.sh/resource-policy: keep` annotation prevents helm uninstall
+  from deleting the PriorityClasses (since other tenants reference them).
+*/}}
+{{- if .Values.priorityClass.create }}
+{{- range .Values.priorityClass.classes }}
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .name }}
+  labels:
+    app.kubernetes.io/managed-by: helm
+    experiment: kcu-portal
+  annotations:
+    "helm.sh/resource-policy": keep
+value: {{ .value }}
+globalDefault: false
+preemptionPolicy: {{ .preemptionPolicy }}
+description: {{ .description | quote }}
+{{- end }}
+{{- end }}
