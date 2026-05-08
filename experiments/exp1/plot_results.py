@@ -197,8 +197,6 @@ def plot_his(ax: plt.Axes, his_data: List[dict]) -> None:
                 linewidth=2.2, marker="o", markersize=6,
                 label=MODE_LABEL.get(mode, mode))
 
-        # Shade difference area between helm and agentic
-    modes_keys = list(by_mode.keys())
     if "helm" in by_mode and "agentic" in by_mode:
         xs = sorted(by_mode["helm"].keys())
         ys_helm   = [by_mode["helm"][x]    for x in xs]
@@ -219,8 +217,8 @@ def plot_his(ax: plt.Axes, his_data: List[dict]) -> None:
                         arrowprops=dict(arrowstyle="->", color="gray", lw=1.0))
 
     ax.set_xlabel("테넌트 수 (N)", fontsize=11)
-    ax.set_ylabel("운영자 개입 횟수 (HIS)", fontsize=11)
-    ax.set_title("(c) Human Intervention Score (HIS)\n테넌트 수 증가 시 수동 작업량",
+    ax.set_ylabel("운영자 부담 지수 (HIS, 복잡도 가중치)", fontsize=11)
+    ax.set_title("(c) Human Intervention Score (HIS)\n테넌트 수 증가 시 운영 부담 비교",
                  fontsize=12, fontweight="bold", loc="left")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9, loc="upper left")

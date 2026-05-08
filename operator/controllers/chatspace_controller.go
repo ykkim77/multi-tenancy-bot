@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -60,6 +61,7 @@ func (r *ChatSpaceReconciler) rebalanceInterval() time.Duration {
 // +kubebuilder:rbac:groups="",resources=namespaces;resourcequotas;limitranges,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is the entry point for the controller manager.
 //
@@ -139,6 +141,9 @@ func (r *ChatSpaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 	if err := r.reconcileNetworkPolicy(ctx, cs, ns.Name); err != nil {
 		return ctrl.Result{}, fmt.Errorf("networkpolicy: %w", err)
+	}
+	if err := r.reconcileRBAC(ctx, cs, ns.Name); err != nil {
+		return ctrl.Result{}, fmt.Errorf("rbac: %w", err)
 	}
 
 	// ── Status update — single write with RetryOnConflict ─────────
@@ -250,6 +255,8 @@ func (r *ChatSpaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.LimitRange{},
 			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
 		Watches(&networkingv1.NetworkPolicy{},
+			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
+		Watches(&rbacv1.RoleBinding{},
 			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
 		Complete(r)
 }

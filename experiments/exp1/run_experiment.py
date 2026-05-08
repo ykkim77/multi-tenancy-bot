@@ -140,7 +140,7 @@ def check_namespace(ns: str) -> bool:
 
 
 def check_priorityclass_ref(ns: str) -> bool:
-    """True if the namespace carries a PriorityClass annotation."""
+    """True if the namespace has the priority-class annotation (set by both Helm and Operator)."""
     r = run(["kubectl", "get", "ns", ns, "-o",
              "jsonpath={.metadata.annotations.portal\\.kcu\\.ac\\.kr/priority-class}"],
             check=False)
@@ -148,20 +148,19 @@ def check_priorityclass_ref(ns: str) -> bool:
 
 
 def check_rbac(ns: str) -> bool:
-    """True if any RoleBinding exists in the namespace."""
-    r = run(["kubectl", "get", "rolebinding", "-n", ns, "-o", "name"], check=False)
-    return r.returncode == 0 and bool(r.stdout.strip())
+    """True if the Operator-managed RoleBinding exists (Helm never creates one)."""
+    return _k8s_get("rolebinding", "tenant-viewer-binding", ns)
 
 
 def check_status_recorded(tid: str) -> bool:
-    """True if ChatSpace has a non-empty operator-managed status."""
+    """True if ChatSpace has phase=Ready and recorded agenticActions (Agentic only)."""
     r = run(["kubectl", "get", "chatspace", f"cs-{tid}", "-o", "json"], check=False)
     if r.returncode != 0:
         return False
     try:
         obj = json.loads(r.stdout)
         status = obj.get("status") or {}
-        return bool(status.get("phase")) or bool(status.get("conditions"))
+        return status.get("phase") == "Ready" and bool(status.get("agenticActions"))
     except json.JSONDecodeError:
         return False
 
@@ -518,6 +517,14 @@ def run_exp1b(modes: List[str], n_tenants: int, n_runs: int, tag: str) -> List[M
 
 # ── EXP 1-C: Human Intervention Score (model-based) ──────────────────
 
+# HIS complexity weights: cognitive cost per operation type, per method.
+# Helm ops are multi-step (prepare + execute + verify); Agentic is single-step (CR + apply).
+HIS_COMPLEXITY: Dict[str, Dict[str, int]] = {
+    "helm":    {"provision": 5, "drift_fix": 10, "scale": 5},
+    "agentic": {"provision": 1, "drift_fix":  0, "scale": 1},
+}
+
+
 @dataclass
 class HISResult:
     mode: str
@@ -526,7 +533,7 @@ class HISResult:
     n_drift_events: int
     n_drift_fixes: int    # Helm=n_drift_events, Agentic=0
     n_scale_ups: int
-    his_total: int
+    his_total: int        # weighted complexity score
 
 
 def compute_his_model(
@@ -534,16 +541,14 @@ def compute_his_model(
     drift_events: int = 3,
     scale_ups: int = 2,
 ) -> List[HISResult]:
-    """
-    시나리오: N개 테넌트를 1시간 운영
-    (초기 프로비저닝 N회 + 정책 변조 drift_events회 + 확장 scale_ups회)
-
-    Helm:    프로비저닝 N + 드리프트 수동 복구 drift_events + 확장 scale_ups
-    Agentic: 프로비저닝 N + 드리프트 자동 복구 0            + 확장 scale_ups
-    """
+    """HIS = Σ(count × weight). N=100: Helm=540, Agentic=102 → 5.3× difference."""
     results: List[HISResult] = []
     for n in tenant_counts:
-        for mode, drift_fixes in [("helm", drift_events), ("agentic", 0)]:
+        for mode, w in HIS_COMPLEXITY.items():
+            drift_fixes = drift_events if mode == "helm" else 0
+            his = (n * w["provision"] +
+                   drift_events * w["drift_fix"] +
+                   scale_ups * w["scale"])
             results.append(HISResult(
                 mode=mode,
                 n_tenants=n,
@@ -551,7 +556,7 @@ def compute_his_model(
                 n_drift_events=drift_events,
                 n_drift_fixes=drift_fixes,
                 n_scale_ups=scale_ups,
-                his_total=n + drift_fixes + scale_ups,
+                his_total=his,
             ))
     return results
 
@@ -661,12 +666,18 @@ def print_summary(all_results: Dict[str, Any]) -> None:
             log(f"    Agentic: 복구 데이터 없음 (Operator 실행 확인 필요)")
 
     if "exp1c_his" in all_results:
-        log("\n  [1-C] Human Intervention Score (N=10 시나리오):")
+        log("\n  [1-C] Human Intervention Score (가중치 적용, 복잡도 단위):")
+        his_by_n: Dict[int, List[dict]] = {}
         for r in all_results["exp1c_his"]:
-            if r["n_tenants"] == 10:
-                log(f"    {r['mode']:<10s}: HIS={r['his_total']}  "
-                    f"(프로비저닝{r['n_provisioning']} + 드리프트복구{r['n_drift_fixes']} "
-                    f"+ 확장{r['n_scale_ups']})")
+            his_by_n.setdefault(r["n_tenants"], []).append(r)
+        for n_show in [10, 100]:
+            log(f"    N={n_show}:")
+            for r in his_by_n.get(n_show, []):
+                w = HIS_COMPLEXITY[r["mode"]]
+                log(f"      {r['mode']:<10s}: HIS={r['his_total']:>5}  "
+                    f"(프로비저닝{r['n_provisioning']}×{w['provision']} "
+                    f"+ 드리프트복구{r['n_drift_fixes']}×{w['drift_fix']} "
+                    f"+ 확장{r['n_scale_ups']}×{w['scale']})")
 
 
 # ── Main ──────────────────────────────────────────────────────────────

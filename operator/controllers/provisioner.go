@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -47,6 +48,12 @@ func (r *ChatSpaceReconciler) reconcileNamespace(ctx context.Context, cs *portal
 		}
 		// Provide a stable label for cross-tenant NetworkPolicy matching.
 		ns.Labels["name"] = name
+		// Annotate the namespace with the tier-derived PriorityClass name so
+		// tooling and the PCR check can confirm the isolation policy is linked.
+		if ns.Annotations == nil {
+			ns.Annotations = map[string]string{}
+		}
+		ns.Annotations["portal.kcu.ac.kr/priority-class"] = fmt.Sprintf("kcu-tenant-%s", string(cs.Spec.Tier))
 		return nil
 	})
 	if err != nil {
@@ -193,6 +200,63 @@ func (r *ChatSpaceReconciler) reconcileNetworkPolicy(
 		return fmt.Errorf("networkpolicy: %w", err)
 	}
 	r.recordIfChanged(cs, op, "NetworkPolicy", np.Name)
+	return nil
+}
+
+// reconcileRBAC creates a read-only Role and a RoleBinding for the tenant
+// namespace. This grants the tenant's default ServiceAccount view access to
+// the resources in its own namespace, completing the isolation stack.
+func (r *ChatSpaceReconciler) reconcileRBAC(
+	ctx context.Context, cs *portalv1.ChatSpace, nsName string,
+) error {
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-viewer", Namespace: nsName},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, role, func() error {
+		if role.Labels == nil {
+			role.Labels = map[string]string{}
+		}
+		for k, v := range commonLabels(cs) {
+			role.Labels[k] = v
+		}
+		role.Rules = []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"pods", "services", "configmaps"},
+			Verbs:     []string{"get", "list", "watch"},
+		}}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("role: %w", err)
+	}
+	r.recordIfChanged(cs, op, "Role", role.Name)
+
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-viewer-binding", Namespace: nsName},
+	}
+	op, err = controllerutil.CreateOrUpdate(ctx, r.Client, rb, func() error {
+		if rb.Labels == nil {
+			rb.Labels = map[string]string{}
+		}
+		for k, v := range commonLabels(cs) {
+			rb.Labels[k] = v
+		}
+		rb.RoleRef = rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "tenant-viewer",
+		}
+		rb.Subjects = []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      "default",
+			Namespace: nsName,
+		}}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("rolebinding: %w", err)
+	}
+	r.recordIfChanged(cs, op, "RoleBinding", rb.Name)
 	return nil
 }
 
