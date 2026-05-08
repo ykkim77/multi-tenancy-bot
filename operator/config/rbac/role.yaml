@@ -28,6 +28,15 @@ rules:
   resources: [rolebindings]
   verbs: [get, list, watch, create, update, patch, delete]
 
+# Allow binding the built-in 'view' ClusterRole to tenant ServiceAccounts.
+# Kubernetes escalation-prevention requires the binder to have explicit
+# 'bind' permission on the role being referenced.
+# resourceNames limits this to 'view' only (principle of least privilege).
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [clusterroles]
+  verbs: [bind]
+  resourceNames: [view]
+
 # The ChatSpace CRD
 - apiGroups: [portal.kcu.ac.kr]
   resources: [chatspaces]
