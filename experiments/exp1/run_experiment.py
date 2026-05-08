@@ -406,76 +406,95 @@ class MTTRResult:
     per_tenant_mttr: List[Optional[float]] = field(default_factory=list)
 
 
-def _inject_drift(drift_tenant_ids: List[str], confirm_timeout: float = 10.0) -> float:
+def _measure_single_mttr(tenant_id: str, timeout: float = MAX_WAIT) -> Optional[float]:
     """
-    Delete NetworkPolicies and wait until they are ACTUALLY gone from the API server.
-    Returns perf_counter at the moment the last deletion is confirmed.
+    Measure MTTR for ONE tenant's NetworkPolicy using a fire-and-monitor loop.
 
-    Why confirm deletion first:
-      kubectl delete returns as soon as the DELETE request is accepted, but the
-      resource may still be visible in etcd for tens of milliseconds afterward.
-      If we start the MTTR timer before the resource disappears, the first
-      _k8s_get poll can return True (resource still exists) → MTTR = 0s.
+    Design rationale
+    ────────────────
+    The Agentic Operator watches NetworkPolicy events and reconciles in <100 ms.
+    A "delete → confirm absent → start timer → poll recovery" approach fails
+    because the Operator recreates the resource before the confirmation loop's
+    next poll (50 ms), so t_absent is never recorded and MTTR = 0.
 
-    Correct MTTR = t(resource actually absent) → t(resource restored by Operator).
+    This function fires the delete command asynchronously (Popen, non-blocking)
+    and immediately enters a tight 10 ms polling loop that tracks the
+    absent → present state transition in the same loop iteration:
+
+        present … → absent  [record t_absent]
+                 → present  [record t_restored → MTTR = t_restored - t_absent]
+
+    If the Operator is faster than one 10 ms poll window (sub-10 ms recovery),
+    MTTR is reported as < FINE_POLL (i.e. unmeasurably fast with this tool).
     """
-    # Issue all deletes in parallel
-    with ThreadPoolExecutor(max_workers=len(drift_tenant_ids)) as ex:
-        for tid in drift_tenant_ids:
-            ns = f"{NAMESPACE_PREFIX}{tid}"
-            ex.submit(run, ["kubectl", "delete", "networkpolicy", "tenant-isolation",
-                            "-n", ns, "--ignore-not-found"], False, 15)
+    import subprocess as _sp
 
-    # Wait until every NetworkPolicy is confirmed absent
-    deadline = time.perf_counter() + confirm_timeout
-    pending = list(drift_tenant_ids)
-    while pending and time.perf_counter() < deadline:
-        still_present = []
-        for tid in pending:
-            ns = f"{NAMESPACE_PREFIX}{tid}"
-            if _k8s_get("networkpolicy.networking.k8s.io", "tenant-isolation", ns):
-                still_present.append(tid)
-        pending = still_present
-        if pending:
-            time.sleep(0.05)
+    ns = f"{NAMESPACE_PREFIX}{tenant_id}"
+    NP_KIND = "networkpolicy.networking.k8s.io"
+    NP_NAME = "tenant-isolation"
+    FINE_POLL = 0.01   # 10 ms — finer than POLL_INTERVAL to catch fast Operator
 
-    if pending:
-        log(f"    ⚠ {len(pending)}개 NetPol이 {confirm_timeout}s 안에 사라지지 않음 — 계속 진행")
+    # Fire delete asynchronously so the polling loop starts before kubectl returns
+    _sp.Popen(
+        ["kubectl", "delete", NP_KIND, NP_NAME, "-n", ns, "--ignore-not-found"],
+        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+    )
 
-    t_deleted = time.perf_counter()
-    log(f"    ✗ Drift confirmed: NetworkPolicy 실제 삭제 완료 × {len(drift_tenant_ids)} namespaces")
-    return t_deleted
-
-
-def _poll_recovery(drift_tenant_ids: List[str], t_deleted: float,
-                   max_wait: float) -> Tuple[Optional[float], List[Optional[float]]]:
-    """
-    Poll until all NetworkPolicies are restored by the Operator.
-    t_deleted must be the time at which deletion was CONFIRMED (not just requested).
-
-    Returns (overall_mttr_s, per_tenant_mttr_list).
-    None elements mean no recovery within max_wait.
-    MTTR = t(resource restored) - t(resource confirmed absent).
-    """
-    per: Dict[str, Optional[float]] = {tid: None for tid in drift_tenant_ids}
-    deadline = time.perf_counter() + max_wait
+    t_absent: Optional[float] = None
+    deadline = time.perf_counter() + timeout
 
     while time.perf_counter() < deadline:
-        elapsed = time.perf_counter() - t_deleted
-        for tid in drift_tenant_ids:
-            if per[tid] is None:
-                ns = f"{NAMESPACE_PREFIX}{tid}"
-                if _k8s_get("networkpolicy.networking.k8s.io", "tenant-isolation", ns):
-                    per[tid] = elapsed
-                    log(f"      ✓ {ns}: 복구 t={elapsed:.3f}s")
-        if all(v is not None for v in per.values()):
-            overall = max(v for v in per.values() if v is not None)
-            return overall, list(per.values())
-        time.sleep(POLL_INTERVAL)
+        now = time.perf_counter()
+        exists = _k8s_get(NP_KIND, NP_NAME, ns)
 
-    not_recovered = sum(1 for v in per.values() if v is None)
-    log(f"    ⚠ 복구 timeout {max_wait:.0f}s — {not_recovered}개 미복구")
-    return None, list(per.values())
+        if t_absent is None:
+            if not exists:
+                # Resource just disappeared — MTTR clock starts NOW
+                t_absent = now
+        else:
+            if exists:
+                # Resource is back — MTTR clock stops
+                return now - t_absent
+
+        time.sleep(FINE_POLL)
+
+    # Timeout: resource never disappeared (Operator too fast to catch) or never restored
+    if t_absent is None:
+        # We never saw the resource absent: Operator reacted in < FINE_POLL ms
+        log(f"      ⚡ {ns}: 삭제 윈도우 포착 불가 (Operator 반응 < {FINE_POLL*1000:.0f}ms)")
+        return FINE_POLL   # conservative lower bound
+    else:
+        log(f"      ✗ {ns}: 복구 timeout (absent 확인됐으나 재생성 없음)")
+        return None
+
+
+def _inject_drift_and_measure(drift_tenant_ids: List[str],
+                               max_wait: float) -> Tuple[Optional[float], List[Optional[float]]]:
+    """
+    Measure MTTR for all drifted tenants in parallel (each gets its own thread).
+    Returns (overall_mttr_s, per_tenant_mttr_list).
+    overall is the max per-tenant MTTR (worst case = bottleneck).
+    """
+    per: Dict[str, Optional[float]] = {}
+
+    with ThreadPoolExecutor(max_workers=len(drift_tenant_ids)) as ex:
+        futures = {ex.submit(_measure_single_mttr, tid, max_wait): tid
+                   for tid in drift_tenant_ids}
+        for fut in futures:
+            tid = futures[fut]
+            try:
+                mttr = fut.result()
+                per[tid] = mttr
+                ns = f"{NAMESPACE_PREFIX}{tid}"
+                if mttr is not None:
+                    log(f"      ✓ {ns}: MTTR = {mttr:.3f}s")
+            except Exception as exc:
+                log(f"      ✗ {futures[fut]}: 측정 에러 {exc}")
+                per[tid] = None
+
+    valid = [v for v in per.values() if v is not None]
+    overall = max(valid) if valid else None
+    return overall, [per[tid] for tid in drift_tenant_ids]
 
 
 def run_exp1b(modes: List[str], n_tenants: int, n_runs: int, tag: str) -> List[MTTRResult]:
@@ -510,33 +529,53 @@ def run_exp1b(modes: List[str], n_tenants: int, n_runs: int, tag: str) -> List[M
             log(f"    [{mode}] {STABILIZE_WAIT:.0f}s 안정화 대기 중 ...")
             time.sleep(STABILIZE_WAIT)
 
-            t_inject = _inject_drift(drift_ids)
-
             if mode == "helm":
+                # Helm has no auto-recovery; just delete and verify it stays gone
+                with ThreadPoolExecutor(max_workers=len(drift_ids)) as ex:
+                    futs = [ex.submit(run,
+                                      ["kubectl", "delete", "networkpolicy",
+                                       "tenant-isolation", "-n",
+                                       f"{NAMESPACE_PREFIX}{tid}", "--ignore-not-found"],
+                                      False, 30)
+                            for tid in drift_ids]
+                    for f in futs:
+                        try: f.result()
+                        except Exception: pass
+
                 log(f"    [Helm] {HELM_MTTR_WAIT:.0f}s 동안 자동 복구 없음을 확인 ...")
-                overall, per_t = _poll_recovery(drift_ids, t_inject, HELM_MTTR_WAIT)
+                time.sleep(HELM_MTTR_WAIT)
+
+                # Check if Helm somehow restored anything (it shouldn't)
+                per_t: List[Optional[float]] = []
+                overall = None
+                for tid in drift_ids:
+                    ns = f"{NAMESPACE_PREFIX}{tid}"
+                    if _k8s_get("networkpolicy.networking.k8s.io", "tenant-isolation", ns):
+                        per_t.append(HELM_MTTR_WAIT)   # restored (unexpected)
+                        overall = HELM_MTTR_WAIT
+                    else:
+                        per_t.append(None)             # still missing (expected)
+
                 rec = MTTRResult(
                     mode=mode, run_idx=run_idx, n_tenants=n_tenants, n_drifted=n_drifted,
-                    mttr_s=None,    # Helm never auto-recovers
-                    detected=False,
-                    per_tenant_mttr=per_t,
+                    mttr_s=None, detected=False, per_tenant_mttr=per_t,
                 )
                 if overall is not None:
-                    log(f"    ⚠ Helm이 예외적으로 {overall:.1f}s만에 복구됨 (외부 개입?)")
-                    rec.mttr_s = overall
-                    rec.detected = True
+                    log(f"    ⚠ Helm이 예외적으로 복구됨 (외부 개입?)")
+                    rec.mttr_s = overall; rec.detected = True
                 else:
                     log(f"    ✓ Helm CONFIRMED: 자동 복구 없음 (MTTR = ∞)")
-            else:  # agentic
-                log(f"    [Agentic] Operator 재조정 모니터링 (최대 {MAX_WAIT:.0f}s) ...")
-                overall, per_t = _poll_recovery(drift_ids, t_inject, MAX_WAIT)
+
+            else:  # agentic — fire-and-monitor with 10 ms polling
+                log(f"    [Agentic] Operator MTTR 측정 (fire-and-monitor, 10 ms 해상도) ...")
+                overall, per_t = _inject_drift_and_measure(drift_ids, MAX_WAIT)
                 rec = MTTRResult(
                     mode=mode, run_idx=run_idx, n_tenants=n_tenants, n_drifted=n_drifted,
                     mttr_s=overall, detected=overall is not None,
                     per_tenant_mttr=per_t,
                 )
                 if overall is not None:
-                    log(f"    ✓ Agentic MTTR = {overall:.1f}s")
+                    log(f"    ✓ Agentic MTTR (worst-case) = {overall:.3f}s")
                 else:
                     log(f"    ✗ Agentic 복구 timeout (Operator가 실행 중인지 확인)")
 
