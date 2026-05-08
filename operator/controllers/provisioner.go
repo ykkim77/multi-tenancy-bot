@@ -270,6 +270,25 @@ func (r *ChatSpaceReconciler) reconcileRBAC(
 	}
 	r.recordIfChanged(cs, op, "Role", role.Name)
 
+	// RoleBinding.roleRef is immutable in Kubernetes.
+	// If an old binding exists with a different roleRef (e.g. created by an
+	// earlier code version that referenced ClusterRole/view), we delete it and
+	// let CreateOrUpdate re-create it with the correct Role reference.
+	existingRB := &rbacv1.RoleBinding{}
+	rbKey := client.ObjectKey{Name: "tenant-viewer-binding", Namespace: nsName}
+	if gerr := r.Client.Get(ctx, rbKey, existingRB); gerr == nil {
+		wantRef := rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "tenant-viewer",
+		}
+		if existingRB.RoleRef != wantRef {
+			if derr := r.Client.Delete(ctx, existingRB); derr != nil && !errors.IsNotFound(derr) {
+				return fmt.Errorf("rolebinding delete stale: %w", derr)
+			}
+		}
+	}
+
 	rb := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: "tenant-viewer-binding", Namespace: nsName},
 	}
