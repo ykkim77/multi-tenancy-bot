@@ -23,14 +23,16 @@ rules:
   resources: [priorityclasses]
   verbs: [get, list, watch, create, update, patch]
 
-# RoleBinding for per-tenant RBAC (policy #6 in PCR metric)
+# RoleBinding + Role for per-tenant RBAC (policy #6 in PCR metric).
+# 'roles' list/watch is required by the controller-runtime informer cache
+# when any rbac.authorization.k8s.io resource is watched.
 - apiGroups: [rbac.authorization.k8s.io]
-  resources: [rolebindings]
+  resources: [roles, rolebindings]
   verbs: [get, list, watch, create, update, patch, delete]
 
 # Allow binding the built-in 'view' ClusterRole to tenant ServiceAccounts.
 # Kubernetes escalation-prevention requires the binder to have explicit
-# 'bind' permission on the role being referenced.
+# 'bind' permission on the ClusterRole being referenced.
 # resourceNames limits this to 'view' only (principle of least privilege).
 - apiGroups: [rbac.authorization.k8s.io]
   resources: [clusterroles]

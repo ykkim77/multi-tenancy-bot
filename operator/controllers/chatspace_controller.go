@@ -21,7 +21,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -259,8 +258,11 @@ func (r *ChatSpaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
 		Watches(&networkingv1.NetworkPolicy{},
 			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
-		Watches(&rbacv1.RoleBinding{},
-			handler.EnqueueRequestsFromMapFunc(r.objectToChatSpaceFromLabels)).
+		// RoleBinding watch intentionally omitted: watching RBAC types causes
+		// the controller-runtime cache to also list Role objects at cluster scope,
+		// requiring additional permissions. Since the Operator reconciles every
+		// 30 s (RequeueAfter), any deleted RoleBinding is re-created on the next
+		// cycle without needing an explicit watch.
 		Complete(r)
 }
 
