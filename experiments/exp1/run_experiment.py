@@ -406,37 +406,68 @@ class MTTRResult:
     per_tenant_mttr: List[Optional[float]] = field(default_factory=list)
 
 
-def _inject_drift(drift_tenant_ids: List[str]) -> float:
-    """Delete NetworkPolicies. Returns perf_counter at injection start."""
-    t0 = time.perf_counter()
-    for tid in drift_tenant_ids:
-        ns = f"{NAMESPACE_PREFIX}{tid}"
-        run(["kubectl", "delete", "networkpolicy", "tenant-isolation",
-             "-n", ns, "--ignore-not-found"], check=False, timeout=15)
-    elapsed = time.perf_counter() - t0
-    log(f"    ✗ Drift injected in {elapsed:.1f}s: "
-        f"NetworkPolicy 삭제 × {len(drift_tenant_ids)} namespaces")
-    return time.perf_counter()
+def _inject_drift(drift_tenant_ids: List[str], confirm_timeout: float = 10.0) -> float:
+    """
+    Delete NetworkPolicies and wait until they are ACTUALLY gone from the API server.
+    Returns perf_counter at the moment the last deletion is confirmed.
+
+    Why confirm deletion first:
+      kubectl delete returns as soon as the DELETE request is accepted, but the
+      resource may still be visible in etcd for tens of milliseconds afterward.
+      If we start the MTTR timer before the resource disappears, the first
+      _k8s_get poll can return True (resource still exists) → MTTR = 0s.
+
+    Correct MTTR = t(resource actually absent) → t(resource restored by Operator).
+    """
+    # Issue all deletes in parallel
+    with ThreadPoolExecutor(max_workers=len(drift_tenant_ids)) as ex:
+        for tid in drift_tenant_ids:
+            ns = f"{NAMESPACE_PREFIX}{tid}"
+            ex.submit(run, ["kubectl", "delete", "networkpolicy", "tenant-isolation",
+                            "-n", ns, "--ignore-not-found"], False, 15)
+
+    # Wait until every NetworkPolicy is confirmed absent
+    deadline = time.perf_counter() + confirm_timeout
+    pending = list(drift_tenant_ids)
+    while pending and time.perf_counter() < deadline:
+        still_present = []
+        for tid in pending:
+            ns = f"{NAMESPACE_PREFIX}{tid}"
+            if _k8s_get("networkpolicy.networking.k8s.io", "tenant-isolation", ns):
+                still_present.append(tid)
+        pending = still_present
+        if pending:
+            time.sleep(0.05)
+
+    if pending:
+        log(f"    ⚠ {len(pending)}개 NetPol이 {confirm_timeout}s 안에 사라지지 않음 — 계속 진행")
+
+    t_deleted = time.perf_counter()
+    log(f"    ✗ Drift confirmed: NetworkPolicy 실제 삭제 완료 × {len(drift_tenant_ids)} namespaces")
+    return t_deleted
 
 
-def _poll_recovery(drift_tenant_ids: List[str], t_inject: float,
+def _poll_recovery(drift_tenant_ids: List[str], t_deleted: float,
                    max_wait: float) -> Tuple[Optional[float], List[Optional[float]]]:
     """
-    Poll until all NetworkPolicies are restored.
+    Poll until all NetworkPolicies are restored by the Operator.
+    t_deleted must be the time at which deletion was CONFIRMED (not just requested).
+
     Returns (overall_mttr_s, per_tenant_mttr_list).
     None elements mean no recovery within max_wait.
+    MTTR = t(resource restored) - t(resource confirmed absent).
     """
     per: Dict[str, Optional[float]] = {tid: None for tid in drift_tenant_ids}
     deadline = time.perf_counter() + max_wait
 
     while time.perf_counter() < deadline:
-        elapsed = time.perf_counter() - t_inject
+        elapsed = time.perf_counter() - t_deleted
         for tid in drift_tenant_ids:
             if per[tid] is None:
                 ns = f"{NAMESPACE_PREFIX}{tid}"
                 if _k8s_get("networkpolicy.networking.k8s.io", "tenant-isolation", ns):
                     per[tid] = elapsed
-                    log(f"      ✓ {ns}: 복구 t={elapsed:.1f}s")
+                    log(f"      ✓ {ns}: 복구 t={elapsed:.3f}s")
         if all(v is not None for v in per.values()):
             overall = max(v for v in per.values() if v is not None)
             return overall, list(per.values())
