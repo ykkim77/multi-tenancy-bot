@@ -23,6 +23,11 @@ rules:
   resources: [priorityclasses]
   verbs: [get, list, watch, create, update, patch]
 
+# RoleBinding for per-tenant RBAC (policy #6 in PCR metric)
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [rolebindings]
+  verbs: [get, list, watch, create, update, patch, delete]
+
 # The ChatSpace CRD
 - apiGroups: [portal.kcu.ac.kr]
   resources: [chatspaces]

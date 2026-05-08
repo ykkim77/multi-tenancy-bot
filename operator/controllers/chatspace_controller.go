@@ -142,6 +142,9 @@ func (r *ChatSpaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.reconcileNetworkPolicy(ctx, cs, ns.Name); err != nil {
 		return ctrl.Result{}, fmt.Errorf("networkpolicy: %w", err)
 	}
+	if err := r.reconcileRoleBinding(ctx, cs, ns.Name); err != nil {
+		return ctrl.Result{}, fmt.Errorf("rolebinding: %w", err)
+	}
 	if err := r.reconcileRBAC(ctx, cs, ns.Name); err != nil {
 		return ctrl.Result{}, fmt.Errorf("rbac: %w", err)
 	}

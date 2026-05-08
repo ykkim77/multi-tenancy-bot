@@ -203,6 +203,45 @@ func (r *ChatSpaceReconciler) reconcileNetworkPolicy(
 	return nil
 }
 
+// reconcileRoleBinding creates or updates a RoleBinding that grants the
+// tenant's default ServiceAccount the built-in "view" ClusterRole.
+// This is the RBAC layer measured as policy #6 in the PCR metric.
+// Name matches check_rbac() in run_experiment.py: "tenant-viewer-binding".
+func (r *ChatSpaceReconciler) reconcileRoleBinding(
+	ctx context.Context, cs *portalv1.ChatSpace, nsName string,
+) error {
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "tenant-viewer-binding",
+			Namespace: nsName,
+		},
+	}
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, rb, func() error {
+		if rb.Labels == nil {
+			rb.Labels = map[string]string{}
+		}
+		for k, v := range commonLabels(cs) {
+			rb.Labels[k] = v
+		}
+		rb.RoleRef = rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "view",
+		}
+		rb.Subjects = []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      "default",
+			Namespace: nsName,
+		}}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("rolebinding: %w", err)
+	}
+	r.recordIfChanged(cs, op, "RoleBinding", rb.Name)
+	return nil
+}
+
 // reconcileRBAC creates a read-only Role and a RoleBinding for the tenant
 // namespace. This grants the tenant's default ServiceAccount view access to
 // the resources in its own namespace, completing the isolation stack.
