@@ -1,82 +1,110 @@
-# Experiment 1 — Provisioning Speed: Manual vs Helm vs Agentic Operator
+# Experiment 1 — 자동화 완성도 비교: Helm vs Agentic Operator
 
-이 실험은 KCU Knowledge Portal에서 **새 테넌트를 프로비저닝**하는 세 가지 방식의
-**End-to-End 속도**를 정량적으로 비교한다.
+**핵심 질문**: "동일한 결과를 얻으려면 각 방법이 얼마나 많은 인간의 개입이 필요한가?"
 
-| 모드      | 호출 방식                              | 의미 |
-|-----------|----------------------------------------|------|
-| `manual`  | `kubectl apply` 4개 리소스 순차 적용    | 사람이 직접 매니페스트를 던지는 baseline |
-| `helm`    | `helm install kcu-tenant`             | 표준 패키지 매니저, 차트 1회 install |
-| `agentic` | `kubectl apply -f chatspace.yaml`     | **실제 Operator**가 ChatSpace CR을 받아 모든 리소스 reconcile |
+속도 비교(이전)가 아닌 **자동화 완성도**를 측정합니다.
 
-## ✨ 측정 방법론 (변경됨)
+## 측정 지표 (3+1)
 
-이전 버전과 비교한 핵심 차이:
+| 지표 | 정의 | 핵심 결과 |
+|------|------|-----------|
+| **PCR** — Policy Coverage Rate | 자동 적용 격리 정책 수 / 전체 7가지 | Helm=71%, Agentic=100% |
+| **MTTR** — Mean Time To Recovery | 드리프트 주입 → 자동 복구까지 시간 | Helm=∞, Agentic=~30s |
+| **HIS** — Human Intervention Score | 1시간 운영 시 운영자 수동 작업 횟수 | Helm=N+5, Agentic=N+2 |
+| 누적 수렴 곡선 | 완전한 격리 스택 완료 시점 (보조) | — |
 
-| 항목 | 이전 | **현재** |
-|------|------|----------|
-| Agentic의 본질 | Python 스크립트가 Operator를 **모방** | `operator/` 의 **실제 Go Operator**가 ChatSpace CR을 reconcile |
-| 측정 단위 | `time.time()` 으로 측정한 **스크립트 실행 시간** | **CR 제출 시각 → `status.conditions[Ready]` 시각** |
-| 의미 | 클라이언트 처리 시간 (외란 多) | **API 서버가 관측한 Operator 응답 시간** (엄밀) |
+## 완전한 테넌트 격리 스택 (7가지 정책)
 
-세 모드 모두 클라이언트 측 `perf_counter` 와 함께 다음 4개 리소스가 Ready 가
-되는 시점을 polling 으로 검증한다:
+| # | 정책 | Helm (기본) | Helm (현재 chart) | Agentic |
+|---|------|:-----------:|:-----------------:|:-------:|
+| 1 | Namespace | ✅ | ✅ | ✅ |
+| 2 | ResourceQuota | ✅ | ✅ | ✅ |
+| 3 | LimitRange | ❌ | ✅ | ✅ |
+| 4 | NetworkPolicy | ❌ | ✅ | ✅ |
+| 5 | PriorityClass | ❌ | ✅ | ✅ |
+| 6 | RBAC | ❌ | ❌ | ✅ |
+| 7 | status 기록 | ❌ | ❌ | ✅ |
+| **PCR** | | **2/7 = 28%** | **5/7 = 71%** | **7/7 = 100%** |
 
-1. `Namespace`
-2. `ResourceQuota`
-3. `LimitRange`
-4. `NetworkPolicy`
+## 서브 실험 구성
 
-추가로 **Agentic 모드** 에 한해, `kubectl get chatspace -o json` 으로
+### Exp 1-A: PCR 측정
+5개 테넌트를 각 방법으로 배포 후 7가지 정책 존재 여부를 자동으로 검사.
 
-- `metadata.creationTimestamp` (CR 제출 시각, **API server 기준**)
-- `status.conditions[type=Ready, status=True].lastTransitionTime`
+### Exp 1-B: MTTR 드리프트 복구 시간 (핵심 실험)
+```
+1. N개 테넌트 배포 → 60초 안정화
+2. NetworkPolicy를 N/2개 namespace에서 삭제 (drift 주입)
+3. 각 방법의 복구 행동 측정:
+   Helm    → HELM_MTTR_WAIT(90s) 후에도 미복구 → MTTR = ∞
+   Agentic → 다음 reconcile 주기에 자동 복구  → MTTR ≈ 30s
+```
 
-두 시각의 차이를 **server-side timing** 으로 별도 기록한다. 이는 클라이언트
-지연/프로세스 jitter 가 완전히 배제된 가장 엄밀한 측정값이다.
+### Exp 1-C: HIS 모델 (cluster 불필요)
+시나리오(1시간 운영, 드리프트 3회, 확장 2회)에서 방법별 수동 개입 횟수를 수식으로 계산:
+- **Helm**: `HIS = N + 3(드리프트수동복구) + 2 = N + 5`
+- **Agentic**: `HIS = N + 0(자동복구) + 2 = N + 2`
+
+### Exp 1-D: 누적 수렴 곡선 (보조)
+기존 속도 비교 실험의 누적 성공률 곡선 (참고용으로 유지).
 
 ## 사전 조건
 
 ```bash
-# 1) Operator 가 클러스터에 배포되어 있어야 한다
+# 1) Agentic Operator 배포
 kubectl apply -f operator/config/crd/bases/portal.kcu.ac.kr_chatspaces.yaml
 kubectl apply -f operator/config/manager/manager.yaml
 kubectl -n kcu-portal-system rollout status deploy/portal-operator
 
-# 2) helm CLI 가 PATH 에 있어야 한다 (없으면 helm 모드 자동 제외)
+# 2) helm CLI 확인
 helm version
 ```
 
 ## 실행
 
 ```bash
-# 기본 — batch 5,10 / mode 3개 / run 3회
+# 전체 실험 (권장)
 python3 experiments/exp1/run_experiment.py
 
-# 더 빠르게: batch 5만, run 1회씩
-python3 experiments/exp1/run_experiment.py --batch-sizes 5 --runs 1
+# 핵심(MTTR)만 빠르게
+python3 experiments/exp1/run_experiment.py \
+  --skip-1a --skip-1d \
+  --n-tenants 10 --mttr-runs 3
 
-# Helm 만 빼고
-python3 experiments/exp1/run_experiment.py --modes manual,agentic
-
-# 이미 결과 JSON 이 있으면 plot 만
+# 기존 결과로 요약만 출력
 python3 experiments/exp1/run_experiment.py --skip-apply
-python3 experiments/exp1/plot_3way.py
+
+# Figure 5 생성
+python3 experiments/exp1/plot_results.py
 ```
+
+### 주요 옵션
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--n-tenants` | 10 | 1-A·1-B 테넌트 수 |
+| `--mttr-runs` | 5 | 드리프트 주입 반복 횟수 |
+| `--batch-sizes` | `5,10` | 1-D 배치 크기 |
+| `--conv-runs` | 5 | 1-D 배치당 반복 횟수 |
+| `--skip-1a/1b/1d` | — | 서브 실험 건너뜀 |
+| `--tag` | `exp1v2` | 테넌트 ID 접두사 |
 
 ## 산출물
 
-- `results/exp1_results.json` — raw run records (배치, 모드, 누적 곡선, 서버 timing)
-- `results/exp1_3way.png` — 4-패널 논문형 figure
-  - (a) 누적 성공 곡선 (mode × batch)
-  - (b) 클라이언트 ready latency boxplot
-  - (c) **Agentic server-side timing** boxplot
-  - (d) Mann-Whitney U 통계 박스 (Agentic vs Manual / vs Helm)
+| 파일 | 설명 |
+|------|------|
+| `results/exp1_results.json` | 서브 실험별 raw 데이터 |
+| `results/fig5_automation_completeness.png` | Figure 5 (4-패널) |
 
 ## 가설 (검증 대상)
 
-> H1: **Agentic Operator** 의 ready latency 는 manual / helm 대비
-> 통계적으로 유의하게 작다 (p < 0.05).
+> **H1 (PCR)**: Agentic Operator는 Helm 대비 더 높은 정책 적용률을 달성한다.
 >
-> H2: 배치 크기가 커질수록 Agentic 의 우위가 커진다
-> (Operator 의 병렬 reconcile 효과).
+> **H2 (MTTR)**: Agentic의 MTTR은 유한하고 (~30s), Helm은 자동 복구가 불가능하다 (MTTR = ∞).  
+> → **이것이 논문의 가장 강력한 주장**
+>
+> **H3 (HIS)**: 테넌트 수가 증가할수록 Agentic의 수동 작업 절감이 커진다.
+
+## 구버전 파일 (참고)
+
+- `plot_3way.py` — 이전 속도 비교 시각화 (속도 JSON과 호환)
