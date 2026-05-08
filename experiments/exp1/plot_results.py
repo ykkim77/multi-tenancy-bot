@@ -20,6 +20,7 @@ from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.gridspec as mgridspec
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -100,83 +101,180 @@ def plot_pcr(ax: plt.Axes, pcr_data: List[dict]) -> None:
     ax.legend(handles=legend_patches, fontsize=9, loc="lower right")
 
 
-# ── (b) MTTR bar chart ────────────────────────────────────────────────
+# ── (b) MTTR broken-axis chart ────────────────────────────────────────
+#
+#  Y-axis is split into two panels:
+#    upper panel:  ~75 s – 125 s  →  shows Helm "∞" bar  (No Auto-Recovery)
+#    ////  (break)  ////
+#    lower panel:  0 s – <2 s     →  shows Agentic sub-second MTTR
+#
+#  Academic standard for comparing values that differ by >100×.
+#  Both panels share the same x-axis (bar positions) so bars and labels
+#  render naturally in whichever panel their scale belongs to.
 
-def plot_mttr(ax: plt.Axes, mttr_data: List[dict]) -> None:
+def plot_mttr(fig: plt.Figure, spec, mttr_data: List[dict]) -> None:
     """
-    Bar chart: MTTR per mode.
-    Helm bars are shown at INFINITY_BAR_HEIGHT with "∞" label and hatching.
-    Agentic bars show mean ± std.
+    Broken-axis MTTR comparison.
+
+    Parameters
+    ----------
+    fig  : parent Figure
+    spec : SubplotSpec cell (e.g. gs[0, 1]) that this panel occupies
     """
     by_mode: Dict[str, List[Optional[float]]] = {}
     for r in mttr_data:
         by_mode.setdefault(r["mode"], []).append(r["mttr_s"])
 
-    modes_order = ["helm", "agentic"]
+    modes_order   = ["helm", "agentic"]
     modes_present = [m for m in modes_order if m in by_mode]
+    x_pos         = np.arange(len(modes_present))
 
-    x = np.arange(len(modes_present))
-    bar_heights, bar_stds, bar_colors, inf_flags = [], [], [], []
+    # ── Compute per-mode statistics ──────────────────────────────────
+    bar_h:    List[float] = []
+    bar_std:  List[float] = []
+    is_inf:   List[bool]  = []
 
     for mode in modes_present:
-        vals = by_mode[mode]
+        vals   = by_mode[mode]
         finite = [v for v in vals if v is not None]
-        n_inf  = sum(1 for v in vals if v is None)
-
-        if mode == "helm" or n_inf == len(vals):
-            bar_heights.append(INFINITY_BAR_HEIGHT)
-            bar_stds.append(0)
-            inf_flags.append(True)
-        elif finite:
-            bar_heights.append(np.mean(finite))
-            bar_stds.append(np.std(finite))
-            inf_flags.append(False)
+        if mode == "helm" or not finite:
+            bar_h.append(INFINITY_BAR_HEIGHT)
+            bar_std.append(0.0)
+            is_inf.append(True)
         else:
-            bar_heights.append(0)
-            bar_stds.append(0)
-            inf_flags.append(False)
+            bar_h.append(float(np.mean(finite)))
+            bar_std.append(float(np.std(finite)))
+            is_inf.append(False)
 
-        bar_colors.append(MODE_COLOR[mode])
+    # ── Dynamic ylim bounds ──────────────────────────────────────────
+    ag_finite = [v for v in by_mode.get("agentic", []) if v is not None]
+    ag_max     = max(ag_finite) if ag_finite else 1.0
+    lower_top  = max(ag_max * 2.2, 0.5)          # lower panel top (≥0.5 s)
 
-    for i, (mode, h, std, is_inf) in enumerate(
-            zip(modes_present, bar_heights, bar_stds, inf_flags)):
-        if is_inf:
-            ax.bar(i, h, color=MODE_COLOR[mode], edgecolor="black",
-                   linewidth=0.8, alpha=0.4, width=0.55,
-                   hatch="///", label=f"{MODE_LABEL.get(mode, mode)} (∞)")
-            ax.text(i, h / 2, "∞\n자동 복구\n불가",
-                    ha="center", va="center", fontsize=13,
-                    fontweight="bold", color=MODE_COLOR[mode])
-            ax.text(i, h + 2, "No Auto-Recovery", ha="center", va="bottom",
-                    fontsize=9, color="dimgray")
+    upper_bot  = INFINITY_BAR_HEIGHT * 0.68       # break starts here
+    upper_top  = INFINITY_BAR_HEIGHT * 1.18       # top of upper panel
+
+    # ── Create two vertically stacked sub-axes inside `spec` ────────
+    inner   = mgridspec.GridSpecFromSubplotSpec(
+        2, 1, subplot_spec=spec,
+        height_ratios=[2, 2.5],   # upper:lower — visual balance
+        hspace=0.06,
+    )
+    ax_top = fig.add_subplot(inner[0])
+    ax_bot = fig.add_subplot(inner[1])
+
+    # ── Draw bars in BOTH axes; each ylim clips to its relevant range ─
+    for i, (mode, h, std, inf) in enumerate(
+            zip(modes_present, bar_h, bar_std, is_inf)):
+        c = MODE_COLOR[mode]
+        for ax in (ax_top, ax_bot):
+            if inf:
+                ax.bar(i, h, color=c, edgecolor="black", linewidth=0.8,
+                       alpha=0.40, width=0.55, hatch="///")
+            else:
+                ax.bar(i, h, yerr=std, capsize=7, color=c,
+                       edgecolor="black", linewidth=0.8,
+                       alpha=0.82, width=0.55,
+                       error_kw={"elinewidth": 1.5})
+                # Individual run scatter on lower panel
+                if ax is ax_bot:
+                    finite = [v for v in by_mode[mode] if v is not None]
+                    if finite:
+                        jit = np.random.uniform(-0.08, 0.08, size=len(finite))
+                        ax.scatter(np.full(len(finite), i) + jit, finite,
+                                   color=c, edgecolor="black",
+                                   s=40, zorder=4, alpha=0.85)
+
+    # ── Annotations ─────────────────────────────────────────────────
+    for i, (mode, h, std, inf) in enumerate(
+            zip(modes_present, bar_h, bar_std, is_inf)):
+        if inf:
+            # "∞" label centred in upper panel
+            mid = (upper_bot + upper_top) / 2
+            ax_top.text(i, mid, "∞\n자동 복구\n불가",
+                        ha="center", va="center", fontsize=13,
+                        fontweight="bold", color=MODE_COLOR[mode])
+            ax_top.text(i, upper_top * 0.97, "No Auto-Recovery",
+                        ha="center", va="top", fontsize=8, color="dimgray")
         else:
-            ax.bar(i, h, yerr=std, capsize=7, color=MODE_COLOR[mode],
-                   edgecolor="black", linewidth=0.8, alpha=0.82, width=0.55,
-                   error_kw={"elinewidth": 1.5},
-                   label=MODE_LABEL.get(mode, mode))
+            # Numeric label above Agentic bar
+            label_y = h + std + lower_top * 0.06
+            ax_bot.text(i, label_y, f"{h:.3f} s",
+                        ha="center", va="bottom", fontsize=10, fontweight="bold")
 
-            # Individual run dots
-            finite = [v for v in by_mode[mode] if v is not None]
-            if finite:
-                jitter = np.random.uniform(-0.08, 0.08, size=len(finite))
-                ax.scatter(np.full(len(finite), i) + jitter, finite,
-                           color=MODE_COLOR[mode], edgecolor="black",
-                           s=40, zorder=4, alpha=0.8)
-                ax.text(i, h + std + 3, f"{h:.1f}s",
-                        ha="center", va="bottom", fontsize=10)
+    # ── Y-axis limits ────────────────────────────────────────────────
+    ax_top.set_ylim(upper_bot, upper_top)
+    ax_bot.set_ylim(0, lower_top)
 
-    ax.set_xticks(x)
-    ax.set_xticklabels([MODE_LABEL.get(m, m) for m in modes_present], fontsize=10)
-    ax.set_ylabel("Recovery Time (s)", fontsize=11)
-    ax.set_ylim(0, INFINITY_BAR_HEIGHT * 1.15)
-    ax.set_title("(b) Drift Recovery Time (MTTR)\n정책 드리프트 후 자동 복구 시간",
-                 fontsize=12, fontweight="bold", loc="left")
-    ax.grid(True, axis="y", alpha=0.3)
+    # ── Broken-axis spine styling ────────────────────────────────────
+    ax_top.spines["bottom"].set_visible(False)
+    ax_bot.spines["top"].set_visible(False)
+    ax_top.tick_params(bottom=False, labelbottom=False)
+    ax_bot.tick_params(top=False)
 
-    # RequeueAfter reference line
-    ax.axhline(30, color="steelblue", linewidth=1.2, linestyle=":",
-               label="RequeueAfter ~30s")
-    ax.legend(fontsize=9, loc="upper right")
+    # Diagonal "break" tick marks at the cut
+    d  = 0.018
+    kw = dict(color="k", clip_on=False, linewidth=1.2,
+              transform=ax_top.transAxes)
+    ax_top.plot((-d, +d), (-d*1.5, +d*1.5), **kw)           # bottom-left
+    ax_top.plot((1 - d, 1 + d), (-d*1.5, +d*1.5), **kw)     # bottom-right
+    kw["transform"] = ax_bot.transAxes
+    ax_bot.plot((-d, +d), (1 - d*1.5, 1 + d*1.5), **kw)     # top-left
+    ax_bot.plot((1 - d, 1 + d), (1 - d*1.5, 1 + d*1.5), **kw)  # top-right
+
+    # ── Axis labels & range annotations ─────────────────────────────
+    # Shared y-label: place between the two panels via ax_top
+    ax_top.set_ylabel("Recovery Time (s)", fontsize=11, labelpad=6)
+    ax_bot.set_ylabel("Recovery Time (s)", fontsize=11, labelpad=6)
+
+    # Small range tags at the right edge of each panel
+    ax_top.text(0.98, 0.96,
+                f"{upper_bot:.0f} – {upper_top:.0f} s  (∞ axis)",
+                transform=ax_top.transAxes, fontsize=7.5,
+                ha="right", va="top", color="dimgray",
+                style="italic")
+    ax_bot.text(0.98, 0.96,
+                f"0 – {lower_top:.2f} s  (Agentic axis)",
+                transform=ax_bot.transAxes, fontsize=7.5,
+                ha="right", va="top", color="dimgray",
+                style="italic")
+
+    # ── X-ticks (bottom panel only) ──────────────────────────────────
+    ax_bot.set_xticks(x_pos)
+    ax_bot.set_xticklabels([MODE_LABEL.get(m, m) for m in modes_present],
+                            fontsize=10)
+
+    # ── Grid ─────────────────────────────────────────────────────────
+    ax_top.grid(True, axis="y", alpha=0.3)
+    ax_bot.grid(True, axis="y", alpha=0.3)
+
+    # ── RequeueAfter reference (shown in lower panel if < lower_top) ──
+    if 30 < lower_top:
+        ax_bot.axhline(30, color="steelblue", linewidth=1.2, linestyle=":",
+                       label="RequeueAfter ~30s")
+
+    # ── Title & legend ────────────────────────────────────────────────
+    ax_top.set_title(
+        "(b) Drift Recovery Time (MTTR)\n정책 드리프트 후 자동 복구 시간",
+        fontsize=12, fontweight="bold", loc="left",
+    )
+
+    legend_patches = []
+    if "helm" in modes_present:
+        legend_patches.append(
+            mpatches.Patch(facecolor=MODE_COLOR["helm"], edgecolor="black",
+                           linewidth=0.8, alpha=0.40, hatch="///",
+                           label=f"{MODE_LABEL.get('helm','Helm')} — ∞ (수동 복구)"),
+        )
+    if "agentic" in modes_present:
+        ag_mean = bar_h[modes_present.index("agentic")]
+        legend_patches.append(
+            mpatches.Patch(facecolor=MODE_COLOR["agentic"], edgecolor="black",
+                           linewidth=0.8, alpha=0.82,
+                           label=f"{MODE_LABEL.get('agentic','Agentic')} — {ag_mean:.3f} s"),
+        )
+    ax_top.legend(handles=legend_patches, fontsize=9, loc="upper left",
+                  framealpha=0.92)
 
 
 # ── (c) HIS line chart ────────────────────────────────────────────────
@@ -283,10 +381,10 @@ def plot_convergence(ax: plt.Axes, conv_data: List[dict]) -> None:
 
 def plot_figure5(data: dict, out_path: Path) -> None:
     fig = plt.figure(figsize=(16, 11))
-    gs  = fig.add_gridspec(2, 2, hspace=0.42, wspace=0.32)
+    gs  = fig.add_gridspec(2, 2, hspace=0.48, wspace=0.34)
 
     ax_pcr  = fig.add_subplot(gs[0, 0])
-    ax_mttr = fig.add_subplot(gs[0, 1])
+    # gs[0, 1] is reserved for broken-axis MTTR (two sub-axes created inside plot_mttr)
     ax_his  = fig.add_subplot(gs[1, 0])
     ax_conv = fig.add_subplot(gs[1, 1])
 
@@ -300,13 +398,14 @@ def plot_figure5(data: dict, out_path: Path) -> None:
                          fontweight="bold", loc="left")
 
     if "exp1b_mttr" in data:
-        plot_mttr(ax_mttr, data["exp1b_mttr"])
+        plot_mttr(fig, gs[0, 1], data["exp1b_mttr"])
     else:
-        ax_mttr.text(0.5, 0.5, "MTTR 데이터 없음\n(--skip-1b 사용됨)",
-                     ha="center", va="center", transform=ax_mttr.transAxes,
-                     fontsize=12, color="gray")
-        ax_mttr.set_title("(b) Drift Recovery Time (MTTR)", fontsize=12,
-                          fontweight="bold", loc="left")
+        ax_mttr_ph = fig.add_subplot(gs[0, 1])
+        ax_mttr_ph.text(0.5, 0.5, "MTTR 데이터 없음\n(--skip-1b 사용됨)",
+                        ha="center", va="center", transform=ax_mttr_ph.transAxes,
+                        fontsize=12, color="gray")
+        ax_mttr_ph.set_title("(b) Drift Recovery Time (MTTR)", fontsize=12,
+                              fontweight="bold", loc="left")
 
     if "exp1c_his" in data:
         plot_his(ax_his, data["exp1c_his"])
