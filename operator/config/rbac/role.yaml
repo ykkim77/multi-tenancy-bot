@@ -23,21 +23,13 @@ rules:
   resources: [priorityclasses]
   verbs: [get, list, watch, create, update, patch]
 
-# RoleBinding + Role for per-tenant RBAC (policy #6 in PCR metric).
-# 'roles' list/watch is required by the controller-runtime informer cache
-# when any rbac.authorization.k8s.io resource is watched.
+# Role + RoleBinding for per-tenant RBAC (policy #6 in PCR metric).
+# 'escalate' is required to create a Role that grants permissions
+# (pods/services/configmaps get/list/watch) the Operator doesn't hold itself.
+# This is the standard pattern for Operators that manage RBAC on behalf of tenants.
 - apiGroups: [rbac.authorization.k8s.io]
   resources: [roles, rolebindings]
-  verbs: [get, list, watch, create, update, patch, delete]
-
-# Allow binding the built-in 'view' ClusterRole to tenant ServiceAccounts.
-# Kubernetes escalation-prevention requires the binder to have explicit
-# 'bind' permission on the ClusterRole being referenced.
-# resourceNames limits this to 'view' only (principle of least privilege).
-- apiGroups: [rbac.authorization.k8s.io]
-  resources: [clusterroles]
-  verbs: [bind]
-  resourceNames: [view]
+  verbs: [get, list, watch, create, update, patch, delete, escalate, bind]
 
 # The ChatSpace CRD
 - apiGroups: [portal.kcu.ac.kr]
